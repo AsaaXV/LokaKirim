@@ -97,7 +97,13 @@ jobs:
         run: node scripts/patch-android-manifest.mjs
 
       - name: Build Debug APK (Siap Pasang)
-        run: npx tauri android build --apk --debug --ci -vv
+        run: |
+          if ! npx tauri android build --apk --debug --ci -v > /tmp/tauri-debug-build.log 2>&1; then
+            echo "=== LOG ERROR BUILD DEBUG APK (120 BARIS TERAKHIR) ==="
+            tail -n 120 /tmp/tauri-debug-build.log
+            exit 1
+          fi
+          tail -n 30 /tmp/tauri-debug-build.log
 
       - name: Kumpulkan Debug APK
         run: |
@@ -120,7 +126,12 @@ jobs:
             echo "Keystore secrets tidak diatur; melewati Release APK (Debug APK tetap dirilis)."
             exit 0
           fi
-          npx tauri android build --apk --ci -vv
+          if ! npx tauri android build --apk --ci -v > /tmp/tauri-release-build.log 2>&1; then
+            echo "=== LOG ERROR BUILD RELEASE APK (120 BARIS TERAKHIR) ==="
+            tail -n 120 /tmp/tauri-release-build.log
+            exit 1
+          fi
+          tail -n 30 /tmp/tauri-release-build.log
           UNSIGNED_APK=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name "*universal*release*.apk" | head -n 1)
           if [ -z "$UNSIGNED_APK" ]; then
             UNSIGNED_APK=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name "*release*.apk" | head -n 1)
