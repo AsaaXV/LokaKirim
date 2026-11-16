@@ -51,14 +51,15 @@ jobs:
             exit 1
           fi
           yes | "$CMDLINE_BIN" --licenses >/dev/null || true
+          SDK_LIST=$("$CMDLINE_BIN" --list 2>/dev/null | awk '{print $1}')
           NDK_DIR=$(find "$SDK_ROOT/ndk" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | sort -V | tail -n 1 || true)
           if [ -z "$NDK_DIR" ]; then
-            NDK_PKG=$("$CMDLINE_BIN" --list 2>/dev/null | grep -oE 'ndk;[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -n 1)
+            NDK_PKG=$(printf '%s\n' "$SDK_LIST" | grep -E '^ndk;[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
             "$CMDLINE_BIN" --install "$NDK_PKG"
             NDK_DIR="$SDK_ROOT/ndk/${NDK_PKG#ndk;}"
           fi
-          PLATFORM_PKG=$("$CMDLINE_BIN" --list 2>/dev/null | grep -oE 'platforms;android-[0-9]+' | sort -V | tail -n 1)
-          BUILD_TOOLS_PKG=$("$CMDLINE_BIN" --list 2>/dev/null | grep -oE 'build-tools;[0-9]+\.[0-9]+\.[0-9]+' | sort -V | tail -n 1)
+          PLATFORM_PKG=$(printf '%s\n' "$SDK_LIST" | grep -E '^platforms;android-[0-9]+$' | sort -V | tail -n 1)
+          BUILD_TOOLS_PKG=$(printf '%s\n' "$SDK_LIST" | grep -E '^build-tools;[0-9]+\.[0-9]+\.[0-9]+$' | sort -V | tail -n 1)
           "$CMDLINE_BIN" --install "platform-tools" "$PLATFORM_PKG" "$BUILD_TOOLS_PKG"
           echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
