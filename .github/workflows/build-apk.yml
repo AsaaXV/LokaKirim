@@ -98,9 +98,11 @@ jobs:
 
       - name: Build Debug APK (Siap Pasang)
         run: |
-          if ! npx tauri android build --apk --debug --ci -v > /tmp/tauri-debug-build.log 2>&1; then
-            echo "=== LOG ERROR BUILD DEBUG APK (120 BARIS TERAKHIR) ==="
-            tail -n 120 /tmp/tauri-debug-build.log
+          if ! npx tauri android build --apk --debug --ci > /tmp/tauri-debug-build.log 2>&1; then
+            echo "=== 80 BARIS LOG BUILD (TANPA DUMP ENV) ==="
+            grep -v "Io(BeforeSpawn" /tmp/tauri-debug-build.log | tail -n 80 || true
+            echo "=== RINGKASAN ERROR INTI ==="
+            grep -v "Io(BeforeSpawn" /tmp/tauri-debug-build.log | grep -iE -C 4 "FAILURE:|What went wrong:|Caused by:|error(\[E[0-9]+\])?:|Execution failed for task|AAPT:" | tail -n 60 || true
             exit 1
           fi
           tail -n 30 /tmp/tauri-debug-build.log
@@ -126,9 +128,11 @@ jobs:
             echo "Keystore secrets tidak diatur; melewati Release APK (Debug APK tetap dirilis)."
             exit 0
           fi
-          if ! npx tauri android build --apk --ci -v > /tmp/tauri-release-build.log 2>&1; then
-            echo "=== LOG ERROR BUILD RELEASE APK (120 BARIS TERAKHIR) ==="
-            tail -n 120 /tmp/tauri-release-build.log
+          if ! npx tauri android build --apk --ci > /tmp/tauri-release-build.log 2>&1; then
+            echo "=== 80 BARIS LOG RELEASE (TANPA DUMP ENV) ==="
+            grep -v "Io(BeforeSpawn" /tmp/tauri-release-build.log | tail -n 80 || true
+            echo "=== RINGKASAN ERROR RELEASE ==="
+            grep -v "Io(BeforeSpawn" /tmp/tauri-release-build.log | grep -iE -C 4 "FAILURE:|What went wrong:|Caused by:|error(\[E[0-9]+\])?:|Execution failed for task|AAPT:" | tail -n 60 || true
             exit 1
           fi
           tail -n 30 /tmp/tauri-release-build.log
