@@ -100,65 +100,91 @@ fn now_ms() -> u64 {
 }
 
 pub fn collect_lan_network_info(port: u16) -> LanNetworkInfo {
-    let mut entries: Vec<(u8, LanAddress)> = Vec::new();
+    let mut found_ips: Vec<std::net::Ipv4Addr> = Vec::new();
 
-    if let Ok(netifs) = local_ip_address::list_afinet_netifas() {
-        for (name, ip) in netifs {
-            if let IpAddr::V4(v4) = ip {
-                if v4.is_loopback() || v4.is_link_local() {
-                    continue;
-                }
-                let octets = v4.octets();
-                if octets[0] == 169 && octets[1] == 254 {
-                    continue;
-                }
-                let addr_str = v4.to_string();
-                let priority = if octets[0] == 192 && octets[1] == 168 {
-                    0
-                } else if octets[0] == 10 {
-                    1
-                } else if octets[0] == 172 && (16..=31).contains(&octets[1]) {
-                    2
+    if let Ok(fib) = std::fs::read_to_string("/proc/net/fib_trie") {
+        let mut prev_ip: Option<std::net::Ipv4Addr> = None;
+        for line in fib.lines() {
+            let trimmed = line.trim();
+            if let Some(rest) = trimmed.strip_prefix("|-- ") {
+                if let Ok(ip) = rest.trim().parse::<std::net::Ipv4Addr>() {
+                    prev_ip = Some(ip);
                 } else {
-                    3
-                };
-
-                entries.push((
-                    priority,
-                    LanAddress {
-                        name,
-                        address: addr_str.clone(),
-                        url: format!("http://{}:{}", addr_str, port),
-                    },
-                ));
-            }
-        }
-    }
-
-    entries.sort_by_key(|(prio, _)| *prio);
-    let mut addresses: Vec<LanAddress> = entries.into_iter().map(|(_, addr)| addr).collect();
-
-    if addresses.is_empty() {
-        for probe in ["192.168.43.1:80", "192.168.1.1:80", "10.0.0.1:80", "8.8.8.8:80"] {
-            if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
-                if sock.connect(probe).is_ok() {
-                    if let Ok(local) = sock.local_addr() {
-                        if let IpAddr::V4(v4) = local.ip() {
-                            if !v4.is_loopback() && !v4.is_unspecified() {
-                                let addr_str = v4.to_string();
-                                addresses.push(LanAddress {
-                                    name: "wlan0".to_string(),
-                                    address: addr_str.clone(),
-                                    url: format!("http://{}:{}", addr_str, port),
-                                });
-                                break;
-                            }
+                    prev_ip = None;
+                }
+            } else if trimmed.contains("/32 host LOCAL") {
+                if let Some(ip) = prev_ip {
+                    if !ip.is_loopback() && !ip.is_link_local() && !ip.is_unspecified() {
+                        let octets = ip.octets();
+                        if !(octets[0] == 169 && octets[1] == 254) && !found_ips.contains(&ip) {
+                            found_ips.push(ip);
                         }
                     }
                 }
             }
         }
     }
+
+    for probe in [
+        "192.168.43.1:80",
+        "192.168.137.1:80",
+        "192.168.1.1:80",
+        "192.168.0.1:80",
+        "10.0.0.1:80",
+        "172.16.0.1:80",
+        "8.8.8.8:80",
+    ] {
+        if let Ok(sock) = std::net::UdpSocket::bind("0.0.0.0:0") {
+            if sock.connect(probe).is_ok() {
+                if let Ok(local) = sock.local_addr() {
+                    if let IpAddr::V4(v4) = local.ip() {
+                        let octets = v4.octets();
+                        if !v4.is_loopback()
+                            && !v4.is_link_local()
+                            && !v4.is_unspecified()
+                            && !(octets[0] == 169 && octets[1] == 254)
+                            && !found_ips.contains(&v4)
+                        {
+                            found_ips.push(v4);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let mut entries: Vec<(u8, LanAddress)> = found_ips
+        .into_iter()
+        .enumerate()
+        .map(|(idx, v4)| {
+            let octets = v4.octets();
+            let priority = if octets[0] == 192 && octets[1] == 168 {
+                0
+            } else if octets[0] == 10 {
+                1
+            } else if octets[0] == 172 && (16..=31).contains(&octets[1]) {
+                2
+            } else {
+                3
+            };
+            let addr_str = v4.to_string();
+            (
+                priority,
+                LanAddress {
+                    name: if idx == 0 {
+                        "wlan0".to_string()
+                    } else {
+                        format!("lan{}", idx)
+                    },
+                    address: addr_str.clone(),
+                    url: format!("http://{}:{}", addr_str, port),
+                },
+            )
+        })
+        .collect();
+
+    entries.sort_by_key(|(prio, _)| *prio);
+    let addresses: Vec<LanAddress> = entries.into_iter().map(|(_, addr)| addr).collect();
 
     let primary_url = addresses
         .first()

@@ -36,7 +36,7 @@ if (!xml.includes('android:usesCleartextTraffic')) {
   );
 } else {
   xml = xml.replace(
-    /android:usesCleartextTraffic="(?:false|true)"/,
+    /android:usesCleartextTraffic="[^"]*"/,
     'android:usesCleartextTraffic="true"'
   );
 }
