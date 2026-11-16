@@ -24,10 +24,14 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
 
       - name: Instal Dependensi Frontend
-        run: npm ci
+        run: |
+          if [ -f package-lock.json ]; then
+            npm ci
+          else
+            npm install
+          fi
 
       - name: Build Frontend Vite (untuk aset Rust tersemat)
         run: npm run build
@@ -55,6 +59,12 @@ jobs:
             armv7-linux-androideabi
             i686-linux-android
             x86_64-linux-android
+
+      - name: Siapkan Cargo.lock untuk Cache Rust
+        run: |
+          if [ ! -f src-tauri/Cargo.lock ]; then
+            cargo generate-lockfile --manifest-path src-tauri/Cargo.toml
+          fi
 
       - name: Cache Kompilasi Rust
         uses: Swatinem/rust-cache@v2
