@@ -1,0 +1,6 @@
+{
+  "name": "LokaKirim",
+  "description": "Aplikasi chat dan berbagi file cepat jaringan Wi-Fi lokal tanpa internet dengan enkripsi End-to-End (E2EE), transfer chunk file besar, dan indikator kestabilan jaringan real-time.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

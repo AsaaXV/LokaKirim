@@ -1,0 +1,9 @@
+{
+  "$schema": "../gen/schemas/mobile-schema.json",
+  "identifier": "default",
+  "description": "Capability bawaan LokaKirim untuk mengakses IPC Rust E2EE dan server Wi-Fi lokal.",
+  "windows": ["main"],
+  "permissions": [
+    "core:default"
+  ]
+}

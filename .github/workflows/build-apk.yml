@@ -1,0 +1,126 @@
+name: Build Android APK (Rust + Tauri v2)
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+jobs:
+  build-android-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Kode Sumber
+        uses: actions/checkout@v4
+
+      - name: Siapkan Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Instal Dependensi Frontend
+        run: npm ci
+
+      - name: Build Frontend Vite (untuk aset Rust tersemat)
+        run: npm run build
+
+      - name: Siapkan JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '17'
+
+      - name: Siapkan Android SDK & NDK
+        id: android
+        uses: android-actions/setup-android@v3
+        with:
+          api-level: '34'
+          build-tools-version: '34.0.0'
+          ndk-version: '27.0.12077973'
+          accept-android-licenses: true
+
+      - name: Siapkan Toolchain Rust & Target Android
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: |
+            aarch64-linux-android
+            armv7-linux-androideabi
+            i686-linux-android
+            x86_64-linux-android
+
+      - name: Cache Kompilasi Rust
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Inisialisasi Proyek Android Tauri v2
+        run: npx tauri android init --ci
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.0.12077973
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.0.12077973
+
+      - name: Patch AndroidManifest.xml (Cleartext LAN & Izin Wi-Fi)
+        run: node scripts/patch-android-manifest.mjs
+
+      - name: Build Debug APK (Siap Pasang)
+        run: npx tauri android build --apk --debug
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.0.12077973
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.0.12077973
+
+      - name: Kumpulkan Debug APK
+        run: |
+          mkdir -p artifacts
+          DEBUG_APK=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name "*universal*debug*.apk" | head -n 1)
+          if [ -z "$DEBUG_APK" ]; then
+            DEBUG_APK=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name "*.apk" | head -n 1)
+          fi
+          cp "$DEBUG_APK" artifacts/LokaKirim-debug.apk
+          ls -lh artifacts/
+
+      - name: Build Release APK (Opsional jika Keystore Secrets Tersedia)
+        if: ${{ secrets.ANDROID_KEYSTORE_BASE64 != '' && secrets.ANDROID_KEYSTORE_PASSWORD != '' && secrets.ANDROID_KEY_ALIAS != '' && secrets.ANDROID_KEY_PASSWORD != '' }}
+        run: |
+          npx tauri android build --apk
+          UNSIGNED_APK=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name "*universal*release*.apk" | head -n 1)
+          if [ -z "$UNSIGNED_APK" ]; then
+            UNSIGNED_APK=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name "*release*.apk" | head -n 1)
+          fi
+          echo "$ANDROID_KEYSTORE_BASE64" | base64 --decode > /tmp/lokakirim-release.keystore
+          "$ANDROID_HOME/build-tools/34.0.0/zipalign" -p -f 4 "$UNSIGNED_APK" /tmp/lokakirim-aligned.apk
+          "$ANDROID_HOME/build-tools/34.0.0/apksigner" sign \
+            --ks /tmp/lokakirim-release.keystore \
+            --ks-pass "pass:$ANDROID_KEYSTORE_PASSWORD" \
+            --ks-key-alias "$ANDROID_KEY_ALIAS" \
+            --key-pass "pass:$ANDROID_KEY_PASSWORD" \
+            --out artifacts/LokaKirim-release.apk \
+            /tmp/lokakirim-aligned.apk
+          rm -f /tmp/lokakirim-release.keystore /tmp/lokakirim-aligned.apk
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+          NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.0.12077973
+          ANDROID_NDK_HOME: ${{ env.ANDROID_HOME }}/ndk/27.0.12077973
+          ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+
+      - name: Upload Artifact APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: LokaKirim-Android-APK
+          path: artifacts/*.apk
+          if-no-files-found: error
+
+      - name: Lampirkan APK ke GitHub Release (Tag v*)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: artifacts/*.apk
+          generate_release_notes: true
