@@ -69,10 +69,10 @@ Workflow akan berjalan otomatis setiap kali terjadi:
 ### Hasil Rilis Otomatis
 Setiap build berhasil akan otomatis menghasilkan:
 1. **GitHub Release** baru di menu **Releases** repositori Anda (menggunakan nama tag `v*` jika dipicu oleh tag, atau tag otomatis `v1.0.<run_number>` pada setiap push) lengkap dengan catatan rilis otomatis.
-2. **File APK siap pasang** (`LokaKirim-debug.apk`) yang langsung terlampir di halaman **Releases** dan juga tersedia di **Workflow Artifacts**.
+2. **Dua file APK siap pasang** (`LokaKirim-debug.apk` dan `LokaKirim-release.apk`) yang langsung terlampir di halaman **Releases** dan juga tersedia di **Workflow Artifacts**.
 
-### Opsi Release APK Bertanda Tangan (Opsional)
-Secara default, **Debug APK** selalu dibuat dan langsung siap dipasang di Android tanpa perlu konfigurasi tambahan. Jika Anda juga ingin workflow otomatis menghasilkan **Release APK** yang ditandatangani dengan keystore pribadi Anda, tambahkan 4 **Repository Secrets** berikut di **Settings → Secrets and variables → Actions**:
+### Tanda Tangan Release APK (Keystore)
+Workflow selalu mengompilasi dan menandatangani **`LokaKirim-release.apk`** secara otomatis (`zipalign` + `apksigner`). Jika **Repository Secrets** belum diatur, workflow akan membuat keystore otomatis dengan `keytool` agar APK tetap siap dipasang. Agar tanda tangan antarversi konsisten (bisa *update* langsung tanpa copot pemasangan), tambahkan 4 **Repository Secrets** berikut di **Settings → Secrets and variables → Actions**:
 
 | Nama Secret | Keterangan |
 | --- | --- |
@@ -88,4 +88,4 @@ Secara default, **Debug APK** selalu dibuat dan langsung siap dipasang di Androi
 - **Frontend**: React 19, TypeScript, Tailwind CSS v4, Lucide Icons, IndexedDB, `@noble/curves`, `@noble/ciphers`, `@noble/hashes`
 - **APK Android & Core Native**: Tauri v2 Android, **Rust** (`axum` HTTP/WebSocket relay, `tokio`, `p256`, `aes-gcm`, `hkdf`, `sha2`, `include_dir`)
 - **Server Web Lokal**: Node.js, Express, `ws`
-- **CI/CD**: GitHub Actions (JDK 17, Android SDK/NDK 27, Rust Android targets, auto GitHub Release)
+- **CI/CD**: GitHub Actions (JDK 21, Android SDK/NDK 27, Rust Android targets, auto GitHub Release Debug + Release APK)
