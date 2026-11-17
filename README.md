@@ -23,11 +23,15 @@
    - File berukuran besar dipecah menjadi *chunk* 256 KB yang dienkripsi satu per satu, lengkap dengan progres waktu nyata, kecepatan transfer, tombol batal, pratinjau gambar langsung di gelembung chat, serta dukungan *Screen Wake Lock* di Android agar transfer tidak terputus.
 4. **Indikator Kestabilan Jaringan Real-Time**
    - Mengukur latensi (*ping/pong* WebSocket), rata-rata RTT, *jitter*, grafik riwayat latensi, dan antrean pesan tertunda secara langsung.
-5. **Dual Runtime: Web & APK Android Native (Rust + Tauri v2)**
-   - **Di dalam APK Android**: Inti **Rust** menjalankan server host Wi-Fi lokal (`axum` pada port `3000`) **sekaligus** mesin kriptografi E2EE native via Tauri IPC. Satu HP Android bisa langsung menjadi Host Wi-Fi bagi HP lain (lewat QR Code atau alamat IP lokal), atau berpindah menjadi Klien ke host teman dengan satu ketukan.
-   - **Di Browser / PC**: Berjalan melalui server Node.js/Express + WebSocket dan kompatibel penuh saling berkirim pesan terenkripsi dengan perangkat Android APK.
-6. **Mode Gelap Default & Optimalisasi Android**
-   - Tata letak dua layar khas WhatsApp Android (Daftar Chat ↔ Ruang Chat dengan sinkronisasi tombol **Back** Android), target sentuh minimal `44px`, lembar lampiran (**Kamera**, **Galeri**, **Dokumen**), dan riwayat tersimpan lokal di `IndexedDB`.
+5. **Panggilan Suara (Telepon) & Video Call (VC) Lokal Berbasis Rust**
+   - Mendukung telepon suara dan video call 1-on-1 (termasuk memilih lawan bicara langsung dari dalam Ruang Grup) tanpa kuota internet.
+   - Menggunakan jalur WebRTC Wi-Fi lokal (*zero-STUN*) dengan *fallback* otomatis & manual ke **Tunnel Media Rust E2EE** (kompresi audio **IMA-ADPCM 4:1** + enkripsi **AES-256-GCM** frame-by-frame di modul Rust `call.rs` & signaling `lan_server.rs`).
+   - Dilengkapi kontrol mikrofon, speaker, kamera depan/belakang, mode minimize mengambang sambil tetap chat, nada dering Web Audio, serta riwayat panggilan otomatis di chat.
+6. **Dual Runtime: Web & APK Android Native (Rust + Tauri v2)**
+   - **Di dalam APK Android**: Inti **Rust** menjalankan server host Wi-Fi lokal (`axum` pada port `3000`), signaling panggilan real-time, codec suara ADPCM + AES-GCM, serta mesin kriptografi E2EE native via Tauri IPC. Satu HP Android bisa langsung menjadi Host Wi-Fi bagi HP lain (lewat QR Code atau alamat IP lokal), atau berpindah menjadi Klien ke host teman dengan satu ketukan.
+   - **Di Browser / PC**: Berjalan melalui server Node.js/Express + WebSocket dan kompatibel penuh saling menelepon, video call, dan berkirim pesan terenkripsi dengan perangkat Android APK.
+7. **Mode Gelap Default & Optimalisasi Android**
+   - Tata letak dua layar khas WhatsApp Android (Daftar Chat ↔ Ruang Chat dengan sinkronisasi tombol **Back** Android), target sentuh minimal `44px`, lembar lampiran (**Kamera**, **Galeri**, **Dokumen**), izin runtime mikrofon/kamera Android otomatis, dan riwayat tersimpan lokal di `IndexedDB`.
 
 ---
 

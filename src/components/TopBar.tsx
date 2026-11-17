@@ -5,11 +5,13 @@ import {
   Lock,
   Moon,
   MoreVertical,
+  Phone,
   QrCode,
   ShieldCheck,
   Sun,
   Trash2,
   Users,
+  Video,
 } from 'lucide-react';
 import type { ChatTarget, NetworkTelemetry, PeerInfo, RoomInfo } from '../types/chat';
 
@@ -26,6 +28,9 @@ interface TopBarProps {
   onOpenNetworkStatus: () => void;
   onOpenWifiShare: () => void;
   onClearActiveHistory: () => void;
+  onStartVoiceCall: () => void;
+  onStartVideoCall: () => void;
+  callDisabled?: boolean;
 }
 
 function getInitials(name: string): string {
@@ -47,6 +52,9 @@ export const TopBar: React.FC<TopBarProps> = ({
   onOpenNetworkStatus,
   onOpenWifiShare,
   onClearActiveHistory,
+  onStartVoiceCall,
+  onStartVideoCall,
+  callDisabled = false,
 }) => {
   const [menuOpen, setMenuOpen] = useState(false);
   const menuRef = useRef<HTMLDivElement | null>(null);
@@ -146,19 +154,42 @@ export const TopBar: React.FC<TopBarProps> = ({
           type="button"
           onClick={onOpenNetworkStatus}
           title="Lihat statistik kestabilan jaringan Wi-Fi real-time"
-          className="inline-flex min-h-[36px] items-center gap-1.5 rounded-full bg-white/80 dark:bg-[#111B21]/70 hover:bg-white dark:hover:bg-[#111B21] border border-slate-200 dark:border-[#2A3942] px-2.5 py-1 text-[11px] sm:text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+          className="inline-flex min-h-[36px] items-center gap-1.5 rounded-full bg-white/80 dark:bg-[#111B21]/70 hover:bg-white dark:hover:bg-[#111B21] border border-slate-200 dark:border-[#2A3942] px-2 sm:px-2.5 py-1 text-[11px] sm:text-xs font-medium transition-colors whitespace-nowrap shrink-0 cursor-pointer"
         >
           <span className={`h-2 w-2 rounded-full shrink-0 ${statusConfig.dotClass}`} />
-          <span className={`hidden xs:inline ${statusConfig.textClass}`}>
+          <span className={`hidden sm:inline ${statusConfig.textClass}`}>
             {statusConfig.label}
           </span>
           {telemetry.latencyMs !== null ? (
             <span className="font-mono tabular-nums text-slate-600 dark:text-[#AEBAC1]">
-              {telemetry.latencyMs} ms
+              {telemetry.latencyMs}ms
             </span>
           ) : (
             <Activity className="h-3 w-3 text-slate-400" />
           )}
+        </button>
+
+        {/* Direct Voice & Video Call Actions (Mobile + Desktop) */}
+        <button
+          type="button"
+          onClick={onStartVideoCall}
+          disabled={callDisabled}
+          title="Video Call Wi-Fi"
+          aria-label="Video Call Wi-Fi"
+          className="flex min-h-[42px] min-w-[40px] sm:min-h-[44px] sm:min-w-[44px] items-center justify-center rounded-full text-slate-700 dark:text-[#AEBAC1] hover:bg-black/5 dark:hover:bg-white/10 hover:text-[#008069] dark:hover:text-[#00A884] disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer"
+        >
+          <Video className="h-5 w-5" />
+        </button>
+
+        <button
+          type="button"
+          onClick={onStartVoiceCall}
+          disabled={callDisabled}
+          title="Telepon Suara Wi-Fi"
+          aria-label="Telepon Suara Wi-Fi"
+          className="flex min-h-[42px] min-w-[40px] sm:min-h-[44px] sm:min-w-[44px] items-center justify-center rounded-full text-slate-700 dark:text-[#AEBAC1] hover:bg-black/5 dark:hover:bg-white/10 hover:text-[#008069] dark:hover:text-[#00A884] disabled:opacity-40 disabled:cursor-not-allowed transition-colors cursor-pointer"
+        >
+          <Phone className="h-4.5 w-4.5" />
         </button>
 
         {/* Desktop Direct Action Buttons */}

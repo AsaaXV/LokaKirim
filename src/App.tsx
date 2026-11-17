@@ -1,14 +1,16 @@
 import { useCallback, useEffect, useState } from 'react';
+import { CallOverlay } from './components/CallOverlay';
 import { ChatViewport } from './components/ChatViewport';
 import { CreateRoomModal } from './components/CreateRoomModal';
 import { NetworkStatusModal } from './components/NetworkStatusModal';
 import { OnboardingModal } from './components/OnboardingModal';
+import { RoomCallPickerModal } from './components/RoomCallPickerModal';
 import { Sidebar } from './components/Sidebar';
 import { TopBar } from './components/TopBar';
 import { VerificationModal } from './components/VerificationModal';
 import { WifiShareModal } from './components/WifiShareModal';
 import { useLocalChat } from './hooks/useLocalChat';
-import type { ChatTarget } from './types/chat';
+import type { CallType, ChatTarget } from './types/chat';
 
 export default function App() {
   const [isDark, setIsDark] = useState<boolean>(() => {
@@ -25,6 +27,10 @@ export default function App() {
   const [networkOpen, setNetworkOpen] = useState(false);
   const [wifiShareOpen, setWifiShareOpen] = useState(false);
   const [createRoomOpen, setCreateRoomOpen] = useState(false);
+  const [roomCallPicker, setRoomCallPicker] = useState<{
+    open: boolean;
+    callType: CallType;
+  }>({ open: false, callType: 'audio' });
 
   useEffect(() => {
     const root = document.documentElement;
@@ -89,16 +95,41 @@ export default function App() {
     clearAllHistory,
     hostUrl,
     isTauriApp,
+    probeHost,
     switchHostUrl,
     resetHostToLocal,
+    callSession,
+    localCallStream,
+    remoteCallStream,
+    callAudioLevels,
+    startCall,
+    acceptCall,
+    rejectCall,
+    hangupCall,
+    toggleCallAudioMute,
+    toggleCallVideoMute,
+    toggleCallSpeakerMute,
+    switchCallCamera,
+    toggleCallMinimized,
+    setCallRemoteCanvas,
+    forceRustCallRelay,
   } = useLocalChat();
 
-  // Keep Android screen awake during active large-file chunk transfers
-  const hasActiveFileTransfer = activeMessages.some(
-    (m) =>
-      m.kind === 'file' &&
-      (m.file?.status === 'sending' || m.file?.status === 'receiving')
+  // Keep Android screen awake during active large-file chunk transfers or live calls
+  const hasActiveCall = Boolean(
+    callSession &&
+      (callSession.status === 'outgoing' ||
+        callSession.status === 'incoming' ||
+        callSession.status === 'connecting' ||
+        callSession.status === 'active')
   );
+  const hasActiveFileTransfer =
+    hasActiveCall ||
+    activeMessages.some(
+      (m) =>
+        m.kind === 'file' &&
+        (m.file?.status === 'sending' || m.file?.status === 'receiving')
+    );
 
   useEffect(() => {
     if (!hasActiveFileTransfer) return;
@@ -230,6 +261,24 @@ export default function App() {
           onOpenNetworkStatus={() => setNetworkOpen(true)}
           onOpenWifiShare={() => setWifiShareOpen(true)}
           onClearActiveHistory={() => clearActiveConversation(activeTarget)}
+          callDisabled={Boolean(
+            (activeTarget.type === 'dm' && isTargetOffline) ||
+              (callSession && callSession.status !== 'ended')
+          )}
+          onStartVoiceCall={() => {
+            if (activeTarget.type === 'dm' && activePeer) {
+              void startCall(activePeer.peerId, 'audio');
+            } else {
+              setRoomCallPicker({ open: true, callType: 'audio' });
+            }
+          }}
+          onStartVideoCall={() => {
+            if (activeTarget.type === 'dm' && activePeer) {
+              void startCall(activePeer.peerId, 'video');
+            } else {
+              setRoomCallPicker({ open: true, callType: 'video' });
+            }
+          }}
         />
 
         <ChatViewport
@@ -281,6 +330,7 @@ export default function App() {
         onRefresh={refreshLanInfo}
         hostUrl={hostUrl}
         isTauriApp={isTauriApp}
+        onProbeHost={probeHost}
         onSwitchHost={switchHostUrl}
         onResetHost={resetHostToLocal}
       />
@@ -297,6 +347,43 @@ export default function App() {
             setMobileView('chat');
           }
         }}
+      />
+
+      <RoomCallPickerModal
+        open={roomCallPicker.open}
+        initialCallType={roomCallPicker.callType}
+        roomName={activeTargetName}
+        peers={peers}
+        onClose={() => setRoomCallPicker((prev) => ({ ...prev, open: false }))}
+        onStartCall={(peerId, callType) => {
+          void startCall(peerId, callType);
+        }}
+      />
+
+      <CallOverlay
+        session={callSession}
+        localStream={localCallStream}
+        remoteStream={remoteCallStream}
+        audioLevels={callAudioLevels}
+        isTauriApp={isTauriApp}
+        onAccept={() => {
+          void acceptCall();
+        }}
+        onReject={() => {
+          void rejectCall();
+        }}
+        onHangup={() => {
+          void hangupCall();
+        }}
+        onToggleAudioMute={toggleCallAudioMute}
+        onToggleVideoMute={toggleCallVideoMute}
+        onToggleSpeakerMute={toggleCallSpeakerMute}
+        onSwitchCamera={() => {
+          void switchCallCamera();
+        }}
+        onToggleMinimized={toggleCallMinimized}
+        onBindRemoteCanvas={setCallRemoteCanvas}
+        onForceRustRelay={forceRustCallRelay}
       />
     </div>
   );

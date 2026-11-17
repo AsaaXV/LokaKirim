@@ -8,8 +8,10 @@ import {
   Image as ImageIcon,
   Lock,
   Paperclip,
+  Phone,
   Send,
   UploadCloud,
+  Video,
   X,
   XCircle,
 } from 'lucide-react';
@@ -220,11 +222,26 @@ export const ChatViewport: React.FC<ChatViewportProps> = ({
                     </div>
                   )}
 
-                  <div
-                    className={`flex ${isSelf ? 'justify-end' : 'justify-start'} ${
-                      isFirstInBurst ? 'mt-2.5' : 'mt-0.5'
-                    }`}
-                  >
+                  {msg.kind === 'system' ? (
+                    <div className="flex items-center justify-center my-2">
+                      <div className="inline-flex items-center gap-2 rounded-lg bg-white/90 dark:bg-[#182229] border border-slate-200/80 dark:border-[#2A3942] px-3 py-1.5 text-xs text-slate-700 dark:text-[#AEBAC1] shadow-xs">
+                        {msg.text?.toLowerCase().includes('video') ? (
+                          <Video className="h-3.5 w-3.5 text-[#00A884] shrink-0" />
+                        ) : (
+                          <Phone className="h-3.5 w-3.5 text-[#00A884] shrink-0" />
+                        )}
+                        <span>{msg.text}</span>
+                        <span className="font-mono tabular-nums text-[11px] text-slate-400 dark:text-[#8696A0]">
+                          · {formatTime(msg.timestamp)}
+                        </span>
+                      </div>
+                    </div>
+                  ) : (
+                    <div
+                      className={`flex ${isSelf ? 'justify-end' : 'justify-start'} ${
+                        isFirstInBurst ? 'mt-2.5' : 'mt-0.5'
+                      }`}
+                    >
                     <div
                       className={`relative max-w-[86%] sm:max-w-[70%] rounded-lg shadow-xs ${
                         isSelf
@@ -371,7 +388,8 @@ export const ChatViewport: React.FC<ChatViewportProps> = ({
                         </div>
                       )}
                     </div>
-                  </div>
+                    </div>
+                  )}
                 </React.Fragment>
               );
             })

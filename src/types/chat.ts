@@ -107,3 +107,37 @@ export interface StoredDeviceIdentity {
   publicKeyHex: string;
   createdAt: number;
 }
+
+export type CallType = 'audio' | 'video';
+
+export type CallStatus =
+  | 'idle'
+  | 'outgoing'
+  | 'incoming'
+  | 'connecting'
+  | 'active'
+  | 'ended';
+
+export type CallTransportMode = 'webrtc' | 'rust-relay';
+
+export interface CallSessionState {
+  callId: string;
+  callType: CallType;
+  status: CallStatus;
+  direction: 'outgoing' | 'incoming';
+  peerId: string;
+  peerName: string;
+  peerDeviceLabel?: string;
+  transportMode: CallTransportMode;
+  audioMuted: boolean;
+  videoMuted: boolean;
+  remoteAudioMuted: boolean;
+  remoteVideoMuted: boolean;
+  speakerMuted: boolean;
+  facingMode: 'user' | 'environment';
+  connectedAt: number | null;
+  statusNote?: string;
+  endReason?: string;
+  minimized: boolean;
+}
+

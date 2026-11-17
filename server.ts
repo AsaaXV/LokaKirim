@@ -20,8 +20,18 @@ interface ConnectedClient {
   peer: PeerInfo;
 }
 
+interface ActiveCallSession {
+  callId: string;
+  callType: 'audio' | 'video';
+  callerId: string;
+  calleeId: string;
+  state: 'ringing' | 'active';
+  startedAt: number;
+}
+
 const clients = new Map<string, ConnectedClient>();
 const socketToPeerId = new Map<WebSocket, string>();
+const activeCalls = new Map<string, ActiveCallSession>();
 
 const rooms = new Map<string, RoomInfo>([
   [
@@ -112,8 +122,25 @@ function relayToTarget(
     return;
   }
 
+  if (targetId === DEFAULT_ROOM_ID) {
+    const defRoom = rooms.get(DEFAULT_ROOM_ID);
+    if (defRoom && senderId && !defRoom.memberIds.includes(senderId)) {
+      defRoom.memberIds.push(senderId);
+    }
+    for (const [peerId, client] of clients.entries()) {
+      if (peerId === senderId) continue;
+      if (client.ws.readyState === WebSocket.OPEN) {
+        client.ws.send(data, { binary: isBinary });
+      }
+    }
+    return;
+  }
+
   const room = rooms.get(targetId);
   if (!room) return;
+  if (senderId && !room.memberIds.includes(senderId)) {
+    room.memberIds.push(senderId);
+  }
 
   for (const memberId of room.memberIds) {
     if (memberId === senderId) continue;
@@ -140,6 +167,7 @@ async function startServer() {
       ok: true,
       peersOnline: clients.size,
       roomsCount: rooms.size,
+      activeCalls: activeCalls.size,
     });
   });
 
@@ -308,6 +336,19 @@ async function startServer() {
 
       if (type === 'room:key_request') {
         const roomId = String(msg.roomId || '').trim();
+        if (roomId === DEFAULT_ROOM_ID) {
+          for (const [peerId, peerClient] of clients.entries()) {
+            if (peerId === senderPeerId) continue;
+            if (peerClient.ws.readyState === WebSocket.OPEN) {
+              sendJson(peerClient.ws, {
+                type: 'room:key_request',
+                roomId,
+                requesterPeerId: senderPeerId,
+              });
+            }
+          }
+          return;
+        }
         const room = rooms.get(roomId);
         if (!room) return;
         // Broadcast key request to other online members in that room
@@ -368,6 +409,126 @@ async function startServer() {
         relayToTarget(conversationType, targetId, senderPeerId, relayPayload, false);
         return;
       }
+
+      if (type === 'call:invite') {
+        const callId = String(msg.callId || '').trim();
+        const targetPeerId = String(msg.targetPeerId || '').trim();
+        const callType = msg.callType === 'video' ? 'video' : 'audio';
+        if (!callId || !targetPeerId) return;
+
+        const targetClient = clients.get(targetPeerId);
+        if (!targetClient || targetClient.ws.readyState !== WebSocket.OPEN) {
+          sendJson(ws, {
+            type: 'call:unavailable',
+            callId,
+            targetPeerId,
+            reason: 'Perangkat tujuan sedang offline',
+          });
+          return;
+        }
+
+        const isBusy = Array.from(activeCalls.values()).some(
+          (c) =>
+            c.callerId === targetPeerId ||
+            c.calleeId === targetPeerId ||
+            c.callerId === senderPeerId ||
+            c.calleeId === senderPeerId
+        );
+        if (isBusy) {
+          sendJson(ws, {
+            type: 'call:busy',
+            callId,
+            targetPeerId,
+            reason: 'Perangkat sedang dalam panggilan lain',
+          });
+          return;
+        }
+
+        activeCalls.set(callId, {
+          callId,
+          callType,
+          callerId: senderPeerId,
+          calleeId: targetPeerId,
+          state: 'ringing',
+          startedAt: Date.now(),
+        });
+
+        sendJson(targetClient.ws, {
+          type: 'call:invite',
+          callId,
+          callType,
+          callerId: senderPeerId,
+          callerName: msg.callerName || null,
+          timestamp: Date.now(),
+        });
+        return;
+      }
+
+      if (type === 'call:accept') {
+        const callId = String(msg.callId || '').trim();
+        let targetPeerId = String(msg.targetPeerId || '').trim();
+        if (!callId) return;
+        const call = activeCalls.get(callId);
+        if (call) {
+          call.state = 'active';
+          call.startedAt = Date.now();
+          if (!targetPeerId) targetPeerId = call.callerId;
+        }
+        const targetClient = clients.get(targetPeerId);
+        if (targetClient && targetClient.ws.readyState === WebSocket.OPEN) {
+          sendJson(targetClient.ws, {
+            type: 'call:accept',
+            callId,
+            peerId: senderPeerId,
+            timestamp: Date.now(),
+          });
+        }
+        return;
+      }
+
+      if (type === 'call:reject' || type === 'call:hangup' || type === 'call:cancel') {
+        const callId = String(msg.callId || '').trim();
+        let targetPeerId = String(msg.targetPeerId || '').trim();
+        if (!callId) return;
+        const removed = activeCalls.get(callId);
+        activeCalls.delete(callId);
+        if (!targetPeerId && removed) {
+          targetPeerId =
+            removed.callerId === senderPeerId ? removed.calleeId : removed.callerId;
+        }
+        const targetClient = clients.get(targetPeerId);
+        if (targetClient && targetClient.ws.readyState === WebSocket.OPEN) {
+          sendJson(targetClient.ws, {
+            ...msg,
+            senderId: senderPeerId,
+          });
+        }
+        return;
+      }
+
+      if (
+        type === 'call:rtc_signal' ||
+        type === 'call:media_state' ||
+        type === 'call:switch_type'
+      ) {
+        const targetPeerId = String(msg.targetPeerId || '').trim();
+        if (!targetPeerId) return;
+        if (type === 'call:switch_type') {
+          const cid = String(msg.callId || '').trim();
+          const call = activeCalls.get(cid);
+          if (call && (msg.callType === 'audio' || msg.callType === 'video')) {
+            call.callType = msg.callType;
+          }
+        }
+        const targetClient = clients.get(targetPeerId);
+        if (targetClient && targetClient.ws.readyState === WebSocket.OPEN) {
+          sendJson(targetClient.ws, {
+            ...msg,
+            senderId: senderPeerId,
+          });
+        }
+        return;
+      }
     });
 
     ws.on('close', () => {
@@ -378,6 +539,21 @@ async function startServer() {
       const existing = clients.get(peerId);
       if (existing && existing.ws === ws) {
         clients.delete(peerId);
+        for (const [cid, call] of activeCalls.entries()) {
+          if (call.callerId === peerId || call.calleeId === peerId) {
+            activeCalls.delete(cid);
+            const otherId = call.callerId === peerId ? call.calleeId : call.callerId;
+            const otherClient = clients.get(otherId);
+            if (otherClient && otherClient.ws.readyState === WebSocket.OPEN) {
+              sendJson(otherClient.ws, {
+                type: 'call:hangup',
+                callId: cid,
+                senderId: peerId,
+                reason: 'peer_disconnected',
+              });
+            }
+          }
+        }
         broadcastJson({ type: 'peer:left', peerId });
       }
     });

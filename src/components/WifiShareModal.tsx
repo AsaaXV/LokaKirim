@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import QRCode from 'qrcode';
 import { Check, Copy, Link2, QrCode, RotateCcw, Wifi, X } from 'lucide-react';
 import { LOCAL_RUST_HOST_URL, normalizeHostUrl } from '../lib/hostConfig';
+import type { RustHostProbeResultDto } from '../lib/tauriBridge';
 import type { LanNetworkInfo } from '../types/chat';
 
 interface WifiShareModalProps {
@@ -11,6 +12,7 @@ interface WifiShareModalProps {
   onRefresh: () => void;
   hostUrl: string;
   isTauriApp: boolean;
+  onProbeHost?: (targetUrl: string) => Promise<RustHostProbeResultDto>;
   onSwitchHost: (nextUrl: string) => string;
   onResetHost: () => string;
 }
@@ -22,6 +24,7 @@ export const WifiShareModal: React.FC<WifiShareModalProps> = ({
   onRefresh,
   hostUrl,
   isTauriApp,
+  onProbeHost,
   onSwitchHost,
   onResetHost,
 }) => {
@@ -30,6 +33,8 @@ export const WifiShareModal: React.FC<WifiShareModalProps> = ({
   const [copied, setCopied] = useState(false);
   const [remoteInput, setRemoteInput] = useState('');
   const [hostError, setHostError] = useState('');
+  const [hostSuccess, setHostSuccess] = useState('');
+  const [probing, setProbing] = useState(false);
 
   const isUsingExternalHost =
     Boolean(hostUrl) &&
@@ -40,6 +45,7 @@ export const WifiShareModal: React.FC<WifiShareModalProps> = ({
     if (open) {
       onRefresh();
       setHostError('');
+      setHostSuccess('');
       setRemoteInput(isUsingExternalHost ? hostUrl : '');
     }
   }, [open, onRefresh, isUsingExternalHost, hostUrl]);
@@ -89,14 +95,33 @@ export const WifiShareModal: React.FC<WifiShareModalProps> = ({
     }
   };
 
-  const handleConnectRemote = (e: React.FormEvent) => {
+  const handleConnectRemote = async (e: React.FormEvent) => {
     e.preventDefault();
     const normalized = normalizeHostUrl(remoteInput);
     if (!normalized) {
-      setHostError('Masukkan alamat IP atau URL host Wi-Fi yang valid (mis. 192.168.1.10:3000)');
+      setHostError('Masukkan alamat IP atau URL host Wi-Fi yang valid (mis. 192.168.43.1:3000)');
+      setHostSuccess('');
       return;
     }
     setHostError('');
+    setHostSuccess('');
+
+    if (onProbeHost) {
+      setProbing(true);
+      const probe = await onProbeHost(normalized);
+      setProbing(false);
+      if (!probe.ok) {
+        setHostError(
+          probe.error ||
+            `Tidak dapat menjangkau ${normalized}. Pastikan LokaKirim Host sedang dibuka dan satu Wi-Fi/hotspot.`
+        );
+        return;
+      }
+      setHostSuccess(
+        `Terhubung ke host (${probe.latencyMs} ms · ${probe.peersOnline} perangkat online)`
+      );
+    }
+
     onSwitchHost(normalized);
   };
 
@@ -252,11 +277,13 @@ export const WifiShareModal: React.FC<WifiShareModalProps> = ({
             />
             <button
               type="submit"
-              className="min-h-[44px] rounded-full border border-[#00A884] px-4 py-2 text-xs font-semibold text-[#008069] dark:text-[#00A884] hover:bg-[#00A884]/10 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+              disabled={probing}
+              className="min-h-[44px] rounded-full border border-[#00A884] px-4 py-2 text-xs font-semibold text-[#008069] dark:text-[#00A884] hover:bg-[#00A884]/10 disabled:opacity-60 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
             >
-              Sambung
+              {probing ? 'Menguji...' : 'Sambung'}
             </button>
           </form>
+          {hostSuccess && <p className="mt-1.5 text-[11px] text-[#008069] dark:text-[#00A884]">{hostSuccess}</p>}
           {hostError && <p className="mt-1.5 text-[11px] text-rose-500">{hostError}</p>}
         </div>
       </div>

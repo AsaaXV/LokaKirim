@@ -5,10 +5,14 @@ import { sha256 } from '@noble/hashes/sha2.js';
 import type { EncryptedPayload } from '../types/chat';
 import {
   isTauriRuntime,
+  rustDecodeAudioFrame,
   rustDecryptChunk,
+  rustDecryptMediaFrame,
   rustDecryptText,
   rustDeriveDmSession,
+  rustEncodeAudioFrame,
   rustEncryptChunk,
+  rustEncryptMediaFrame,
   rustEncryptText,
   rustGenerateKeyPair,
   rustGenerateRoomKey,
@@ -318,3 +322,213 @@ export async function decryptBinaryChunkAsync(
   }
   return decryptBinaryChunk(aesKey, ivBase64, encryptedBytes);
 }
+
+const IMA_INDEX_TABLE = [-1, -1, -1, -1, 2, 4, 6, 8, -1, -1, -1, -1, 2, 4, 6, 8];
+const IMA_STEP_TABLE = [
+  7, 8, 9, 10, 11, 12, 13, 14, 16, 17, 19, 21, 23, 25, 28, 31, 34, 37, 41, 45, 50, 55, 60, 66,
+  73, 80, 88, 97, 107, 118, 130, 143, 157, 173, 190, 209, 230, 253, 279, 307, 337, 371, 408, 449,
+  494, 544, 598, 658, 724, 796, 876, 963, 1060, 1166, 1282, 1411, 1552, 1707, 1878, 2066, 2272,
+  2499, 2749, 3024, 3327, 3660, 4026, 4428, 4871, 5358, 5894, 6484, 7132, 7845, 8630, 9493,
+  10442, 11487, 12635, 13899, 15289, 16818, 18500, 20350, 22385, 24623, 27086, 29794, 32767,
+];
+
+function clampI16(v: number): number {
+  return v < -32768 ? -32768 : v > 32767 ? 32767 : v;
+}
+
+export function encodeImaAdpcmJs(samples: Int16Array): Uint8Array {
+  if (samples.length === 0) return new Uint8Array(0);
+  let predictor = samples[0];
+  let stepIndex = 0;
+  const remaining = samples.length - 1;
+  const hasOddTail = remaining % 2;
+  const out = new Uint8Array(4 + Math.ceil(remaining / 2));
+
+  out[0] = predictor & 0xff;
+  out[1] = (predictor >> 8) & 0xff;
+  out[2] = stepIndex;
+  out[3] = hasOddTail;
+
+  let outIdx = 4;
+  let curByte = 0;
+  let lowNibble = true;
+
+  for (let i = 1; i < samples.length; i++) {
+    const step = IMA_STEP_TABLE[stepIndex];
+    let diff = samples[i] - predictor;
+    let nibble = 0;
+    if (diff < 0) {
+      nibble = 8;
+      diff = -diff;
+    }
+
+    let delta = step >> 3;
+    if (diff >= step) {
+      nibble |= 4;
+      diff -= step;
+      delta += step;
+    }
+    if (diff >= step >> 1) {
+      nibble |= 2;
+      diff -= step >> 1;
+      delta += step >> 1;
+    }
+    if (diff >= step >> 2) {
+      nibble |= 1;
+      delta += step >> 2;
+    }
+
+    predictor = clampI16((nibble & 8) !== 0 ? predictor - delta : predictor + delta);
+    stepIndex = Math.max(0, Math.min(88, stepIndex + IMA_INDEX_TABLE[nibble & 0x0f]));
+
+    if (lowNibble) {
+      curByte = nibble & 0x0f;
+      lowNibble = false;
+    } else {
+      curByte |= (nibble & 0x0f) << 4;
+      out[outIdx++] = curByte;
+      lowNibble = true;
+    }
+  }
+  if (!lowNibble) {
+    out[outIdx++] = curByte;
+  }
+  return out;
+}
+
+export function decodeImaAdpcmJs(encoded: Uint8Array): Int16Array {
+  if (encoded.length < 4) return new Int16Array(0);
+  const rawPred = encoded[0] | (encoded[1] << 8);
+  let predictor = rawPred >= 0x8000 ? rawPred - 0x10000 : rawPred;
+  let stepIndex = Math.max(0, Math.min(88, encoded[2]));
+  const hasOddTail = encoded[3] === 1;
+  const bodyLen = encoded.length - 4;
+  const totalNibbles = bodyLen === 0 ? 0 : hasOddTail ? bodyLen * 2 - 1 : bodyLen * 2;
+  const samples = new Int16Array(1 + totalNibbles);
+  samples[0] = predictor;
+
+  for (let idx = 0; idx < totalNibbles; idx++) {
+    const byte = encoded[4 + (idx >> 1)];
+    const nibble = (idx & 1) === 0 ? byte & 0x0f : (byte >> 4) & 0x0f;
+    const step = IMA_STEP_TABLE[stepIndex];
+    let delta = step >> 3;
+    if ((nibble & 4) !== 0) delta += step;
+    if ((nibble & 2) !== 0) delta += step >> 1;
+    if ((nibble & 1) !== 0) delta += step >> 2;
+
+    predictor = clampI16((nibble & 8) !== 0 ? predictor - delta : predictor + delta);
+    samples[1 + idx] = predictor;
+    stepIndex = Math.max(0, Math.min(88, stepIndex + IMA_INDEX_TABLE[nibble & 0x0f]));
+  }
+  return samples;
+}
+
+export async function encodeAudioFrameAsync(
+  aesKey: Uint8Array,
+  pcmSamples: Int16Array
+): Promise<{ ivBase64: string; encryptedBytes: Uint8Array }> {
+  const pcmBytes = new Uint8Array(
+    pcmSamples.buffer,
+    pcmSamples.byteOffset,
+    pcmSamples.byteLength
+  );
+  if (isTauriRuntime()) {
+    try {
+      const res = await rustEncodeAudioFrame(
+        bytesToBase64(aesKey),
+        bytesToBase64(pcmBytes)
+      );
+      return {
+        ivBase64: res.ivBase64,
+        encryptedBytes: base64ToBytes(res.payloadBase64),
+      };
+    } catch {
+      // Fallback to JS
+    }
+  }
+  const adpcm = encodeImaAdpcmJs(pcmSamples);
+  const iv = new Uint8Array(12);
+  crypto.getRandomValues(iv);
+  const encryptedBytes = gcm(aesKey, iv).encrypt(adpcm);
+  return {
+    ivBase64: bytesToBase64(iv),
+    encryptedBytes,
+  };
+}
+
+export async function decodeAudioFrameAsync(
+  aesKey: Uint8Array,
+  ivBase64: string,
+  encryptedBytes: Uint8Array
+): Promise<Int16Array> {
+  if (isTauriRuntime()) {
+    try {
+      const pcmBase64 = await rustDecodeAudioFrame(
+        bytesToBase64(aesKey),
+        ivBase64,
+        bytesToBase64(encryptedBytes)
+      );
+      const raw = base64ToBytes(pcmBase64);
+      const samples = new Int16Array(Math.floor(raw.byteLength / 2));
+      const dv = new DataView(raw.buffer, raw.byteOffset, raw.byteLength);
+      for (let i = 0; i < samples.length; i++) {
+        samples[i] = dv.getInt16(i * 2, true);
+      }
+      return samples;
+    } catch {
+      // Fallback to JS
+    }
+  }
+  const iv = base64ToBytes(ivBase64);
+  const adpcm = gcm(aesKey, iv).decrypt(encryptedBytes);
+  return decodeImaAdpcmJs(adpcm);
+}
+
+export async function encryptMediaFrameAsync(
+  aesKey: Uint8Array,
+  rawBytes: Uint8Array
+): Promise<{ ivBase64: string; encryptedBytes: Uint8Array }> {
+  if (isTauriRuntime()) {
+    try {
+      const res = await rustEncryptMediaFrame(
+        bytesToBase64(aesKey),
+        bytesToBase64(rawBytes)
+      );
+      return {
+        ivBase64: res.ivBase64,
+        encryptedBytes: base64ToBytes(res.encryptedBase64),
+      };
+    } catch {
+      // Fallback to JS
+    }
+  }
+  const iv = new Uint8Array(12);
+  crypto.getRandomValues(iv);
+  const encryptedBytes = gcm(aesKey, iv).encrypt(rawBytes);
+  return {
+    ivBase64: bytesToBase64(iv),
+    encryptedBytes,
+  };
+}
+
+export async function decryptMediaFrameAsync(
+  aesKey: Uint8Array,
+  ivBase64: string,
+  encryptedBytes: Uint8Array
+): Promise<Uint8Array> {
+  if (isTauriRuntime()) {
+    try {
+      const plainB64 = await rustDecryptMediaFrame(
+        bytesToBase64(aesKey),
+        ivBase64,
+        bytesToBase64(encryptedBytes)
+      );
+      return base64ToBytes(plainB64);
+    } catch {
+      // Fallback to JS
+    }
+  }
+  const iv = base64ToBytes(ivBase64);
+  return gcm(aesKey, iv).decrypt(encryptedBytes);
+}
+

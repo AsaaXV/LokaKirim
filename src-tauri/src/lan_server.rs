@@ -16,7 +16,10 @@ use serde_json::{json, Value};
 use std::{
     collections::HashMap,
     net::{IpAddr, SocketAddr},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    },
     time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::sync::{mpsc, RwLock};
@@ -75,6 +78,23 @@ struct BinaryRelayHeader {
     sender_id: String,
 }
 
+static ACTIVE_CALL_COUNTER: AtomicUsize = AtomicUsize::new(0);
+
+pub fn active_call_count_sync() -> usize {
+    ACTIVE_CALL_COUNTER.load(Ordering::Relaxed)
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActiveCallSession {
+    pub call_id: String,
+    pub call_type: String,
+    pub caller_id: String,
+    pub callee_id: String,
+    pub state: String,
+    pub started_at: u64,
+}
+
 struct ConnectedClient {
     tx: mpsc::UnboundedSender<Message>,
     peer: PeerInfo,
@@ -84,6 +104,7 @@ struct ConnectedClient {
 struct ServerStateInner {
     clients: HashMap<String, ConnectedClient>,
     rooms: HashMap<String, RoomInfo>,
+    calls: HashMap<String, ActiveCallSession>,
     next_conn_id: u64,
 }
 
@@ -210,6 +231,7 @@ async fn api_health(State(state): State<AppState>) -> Json<Value> {
         "ok": true,
         "peersOnline": guard.clients.len(),
         "roomsCount": guard.rooms.len(),
+        "activeCalls": guard.calls.len(),
         "engine": "rust-axum"
     }))
 }
@@ -283,23 +305,43 @@ async fn relay_to_target(
     sender_id: &str,
     msg: Message,
 ) {
-    let guard = state.inner.read().await;
-    if conversation_type == "dm" {
-        if let Some(target_client) = guard.clients.get(target_id) {
-            let _ = target_client.tx.send(msg);
+    let recipients: Vec<mpsc::UnboundedSender<Message>> = {
+        let mut guard = state.inner.write().await;
+        if conversation_type == "dm" {
+            guard
+                .clients
+                .get(target_id)
+                .map(|c| vec![c.tx.clone()])
+                .unwrap_or_default()
+        } else if target_id == DEFAULT_ROOM_ID {
+            if let Some(room) = guard.rooms.get_mut(DEFAULT_ROOM_ID) {
+                if !sender_id.is_empty() && !room.member_ids.iter().any(|id| id == sender_id) {
+                    room.member_ids.push(sender_id.to_string());
+                }
+            }
+            guard
+                .clients
+                .iter()
+                .filter(|(peer_id, _)| peer_id.as_str() != sender_id)
+                .map(|(_, c)| c.tx.clone())
+                .collect()
+        } else if let Some(room) = guard.rooms.get_mut(target_id) {
+            if !sender_id.is_empty() && !room.member_ids.iter().any(|id| id == sender_id) {
+                room.member_ids.push(sender_id.to_string());
+            }
+            let member_ids = room.member_ids.clone();
+            member_ids
+                .iter()
+                .filter(|id| id.as_str() != sender_id)
+                .filter_map(|id| guard.clients.get(id).map(|c| c.tx.clone()))
+                .collect()
+        } else {
+            Vec::new()
         }
-        return;
-    }
+    };
 
-    if let Some(room) = guard.rooms.get(target_id) {
-        for member_id in &room.member_ids {
-            if member_id == sender_id {
-                continue;
-            }
-            if let Some(member_client) = guard.clients.get(member_id) {
-                let _ = member_client.tx.send(msg.clone());
-            }
-        }
+    for tx in recipients {
+        let _ = tx.send(msg.clone());
     }
 }
 
@@ -576,7 +618,13 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             "requesterPeerId": sender_peer_id,
                         });
                         let guard = state.inner.read().await;
-                        if let Some(room) = guard.rooms.get(room_id) {
+                        if room_id == DEFAULT_ROOM_ID {
+                            for (peer_id, client) in &guard.clients {
+                                if peer_id != sender_peer_id {
+                                    send_json_tx(&client.tx, &payload);
+                                }
+                            }
+                        } else if let Some(room) = guard.rooms.get(room_id) {
                             for member_id in &room.member_ids {
                                 if member_id == sender_peer_id {
                                     continue;
@@ -666,6 +714,200 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         )
                         .await;
                     }
+                    "call:invite" => {
+                        let call_id = parsed
+                            .get("callId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        let target_peer_id = parsed
+                            .get("targetPeerId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        let call_type = parsed
+                            .get("callType")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("audio")
+                            .to_string();
+                        if call_id.is_empty() || target_peer_id.is_empty() {
+                            continue;
+                        }
+
+                        let outcome = {
+                            let mut guard = state.inner.write().await;
+                            let target_online = guard.clients.contains_key(&target_peer_id);
+                            if !target_online {
+                                Err(("call:unavailable", "Perangkat tujuan sedang offline"))
+                            } else {
+                                let busy = guard.calls.values().any(|c| {
+                                    c.caller_id == target_peer_id
+                                        || c.callee_id == target_peer_id
+                                        || c.caller_id == *sender_peer_id
+                                        || c.callee_id == *sender_peer_id
+                                });
+                                if busy {
+                                    Err(("call:busy", "Perangkat sedang dalam panggilan lain"))
+                                } else {
+                                    guard.calls.insert(
+                                        call_id.clone(),
+                                        ActiveCallSession {
+                                            call_id: call_id.clone(),
+                                            call_type: call_type.clone(),
+                                            caller_id: sender_peer_id.clone(),
+                                            callee_id: target_peer_id.clone(),
+                                            state: "ringing".to_string(),
+                                            started_at: now_ms(),
+                                        },
+                                    );
+                                    ACTIVE_CALL_COUNTER.store(guard.calls.len(), Ordering::Relaxed);
+                                    Ok(guard.clients.get(&target_peer_id).map(|c| c.tx.clone()))
+                                }
+                            }
+                        };
+
+                        match outcome {
+                            Ok(Some(target_tx)) => {
+                                let payload = json!({
+                                    "type": "call:invite",
+                                    "callId": call_id,
+                                    "callType": call_type,
+                                    "callerId": sender_peer_id,
+                                    "callerName": parsed.get("callerName").cloned().unwrap_or(Value::Null),
+                                    "timestamp": now_ms(),
+                                });
+                                send_json_tx(&target_tx, &payload);
+                            }
+                            Ok(None) => {}
+                            Err((err_type, reason)) => {
+                                send_json_tx(
+                                    &tx,
+                                    &json!({
+                                        "type": err_type,
+                                        "callId": call_id,
+                                        "targetPeerId": target_peer_id,
+                                        "reason": reason,
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                    "call:accept" => {
+                        let call_id = parsed
+                            .get("callId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim();
+                        let target_peer_id = parsed
+                            .get("targetPeerId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim();
+                        if call_id.is_empty() {
+                            continue;
+                        }
+                        let forward_tx = {
+                            let mut guard = state.inner.write().await;
+                            let mut resolved_target = target_peer_id.to_string();
+                            if let Some(call) = guard.calls.get_mut(call_id) {
+                                call.state = "active".to_string();
+                                call.started_at = now_ms();
+                                if resolved_target.is_empty() {
+                                    resolved_target = call.caller_id.clone();
+                                }
+                            }
+                            guard.clients.get(&resolved_target).map(|c| c.tx.clone())
+                        };
+                        if let Some(target_tx) = forward_tx {
+                            send_json_tx(
+                                &target_tx,
+                                &json!({
+                                    "type": "call:accept",
+                                    "callId": call_id,
+                                    "peerId": sender_peer_id,
+                                    "timestamp": now_ms(),
+                                }),
+                            );
+                        }
+                    }
+                    "call:reject" | "call:hangup" | "call:cancel" => {
+                        let call_id = parsed
+                            .get("callId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim();
+                        let target_peer_id = parsed
+                            .get("targetPeerId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim();
+                        if call_id.is_empty() {
+                            continue;
+                        }
+                        let forward_tx = {
+                            let mut guard = state.inner.write().await;
+                            let removed = guard.calls.remove(call_id);
+                            ACTIVE_CALL_COUNTER.store(guard.calls.len(), Ordering::Relaxed);
+                            let mut resolved_target = target_peer_id.to_string();
+                            if resolved_target.is_empty() {
+                                if let Some(call) = removed {
+                                    resolved_target = if call.caller_id == *sender_peer_id {
+                                        call.callee_id
+                                    } else {
+                                        call.caller_id
+                                    };
+                                }
+                            }
+                            guard.clients.get(&resolved_target).map(|c| c.tx.clone())
+                        };
+                        if let Some(target_tx) = forward_tx {
+                            let mut relayed = parsed.clone();
+                            if let Some(obj) = relayed.as_object_mut() {
+                                obj.insert(
+                                    "senderId".to_string(),
+                                    Value::String(sender_peer_id.clone()),
+                                );
+                            }
+                            send_json_tx(&target_tx, &relayed);
+                        }
+                    }
+                    "call:rtc_signal" | "call:media_state" | "call:switch_type" => {
+                        let target_peer_id = parsed
+                            .get("targetPeerId")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .trim();
+                        if target_peer_id.is_empty() {
+                            continue;
+                        }
+                        if msg_type == "call:switch_type" {
+                            if let (Some(cid), Some(ct)) = (
+                                parsed.get("callId").and_then(|v| v.as_str()),
+                                parsed.get("callType").and_then(|v| v.as_str()),
+                            ) {
+                                let mut guard = state.inner.write().await;
+                                if let Some(call) = guard.calls.get_mut(cid) {
+                                    call.call_type = ct.to_string();
+                                }
+                            }
+                        }
+                        let target_tx = {
+                            let guard = state.inner.read().await;
+                            guard.clients.get(target_peer_id).map(|c| c.tx.clone())
+                        };
+                        if let Some(ttx) = target_tx {
+                            let mut relayed = parsed.clone();
+                            if let Some(obj) = relayed.as_object_mut() {
+                                obj.insert(
+                                    "senderId".to_string(),
+                                    Value::String(sender_peer_id.clone()),
+                                );
+                            }
+                            send_json_tx(&ttx, &relayed);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -677,7 +919,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
     write_task.abort();
 
     if let Some(peer_id) = current_peer_id {
-        let removed = {
+        let (removed, orphaned_calls) = {
             let mut guard = state.inner.write().await;
             let is_same_conn = guard
                 .clients
@@ -685,11 +927,40 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 .map(|c| c.conn_id == current_conn_id)
                 .unwrap_or(false);
             if is_same_conn {
-                guard.clients.remove(&peer_id).is_some()
+                guard.clients.remove(&peer_id);
+                let mut ended = Vec::new();
+                guard.calls.retain(|_, call| {
+                    if call.caller_id == peer_id || call.callee_id == peer_id {
+                        let other_id = if call.caller_id == peer_id {
+                            call.callee_id.clone()
+                        } else {
+                            call.caller_id.clone()
+                        };
+                        if let Some(other_client) = guard.clients.get(&other_id) {
+                            ended.push((other_client.tx.clone(), call.call_id.clone()));
+                        }
+                        false
+                    } else {
+                        true
+                    }
+                });
+                ACTIVE_CALL_COUNTER.store(guard.calls.len(), Ordering::Relaxed);
+                (true, ended)
             } else {
-                false
+                (false, Vec::new())
             }
         };
+        for (other_tx, call_id) in orphaned_calls {
+            send_json_tx(
+                &other_tx,
+                &json!({
+                    "type": "call:hangup",
+                    "callId": call_id,
+                    "senderId": peer_id,
+                    "reason": "peer_disconnected",
+                }),
+            );
+        }
         if removed {
             broadcast_json(
                 &state,
@@ -719,6 +990,7 @@ pub async fn start_lan_server(port: u16) {
         inner: Arc::new(RwLock::new(ServerStateInner {
             clients: HashMap::new(),
             rooms,
+            calls: HashMap::new(),
             next_conn_id: 0,
         })),
     };

@@ -137,8 +137,8 @@ export const NetworkStatusModal: React.FC<NetworkStatusModalProps> = ({
             <span className="font-mono text-slate-700 dark:text-[#E9EDEF]">
               {isTauriApp
                 ? hostUrl && hostUrl !== 'http://127.0.0.1:3000'
-                  ? 'Rust E2EE · Klien Wi-Fi'
-                  : 'Rust Native (Host + E2EE)'
+                  ? 'Rust Native WS + E2EE (Klien)'
+                  : 'Rust Native (Host + WS + E2EE)'
                 : 'Relay Wi-Fi Lokal'}
             </span>
           </div>
