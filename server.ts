@@ -113,13 +113,15 @@ function relayToTarget(
   senderId: string,
   data: string | Buffer,
   isBinary = false
-) {
+): number {
+  let delivered = 0;
   if (conversationType === 'dm') {
     const targetClient = clients.get(targetId);
     if (targetClient && targetClient.ws.readyState === WebSocket.OPEN) {
       targetClient.ws.send(data, { binary: isBinary });
+      delivered += 1;
     }
-    return;
+    return delivered;
   }
 
   if (targetId === DEFAULT_ROOM_ID) {
@@ -131,13 +133,14 @@ function relayToTarget(
       if (peerId === senderId) continue;
       if (client.ws.readyState === WebSocket.OPEN) {
         client.ws.send(data, { binary: isBinary });
+        delivered += 1;
       }
     }
-    return;
+    return delivered;
   }
 
   const room = rooms.get(targetId);
-  if (!room) return;
+  if (!room) return 0;
   if (senderId && !room.memberIds.includes(senderId)) {
     room.memberIds.push(senderId);
   }
@@ -147,8 +150,10 @@ function relayToTarget(
     const memberClient = clients.get(memberId);
     if (memberClient && memberClient.ws.readyState === WebSocket.OPEN) {
       memberClient.ws.send(data, { binary: isBinary });
+      delivered += 1;
     }
   }
+  return delivered;
 }
 
 function rawDataToBuffer(data: RawData): Buffer {
@@ -394,8 +399,14 @@ async function startServer() {
           encryptedPayload: msg.encryptedPayload,
           verifiedAtSend: Boolean(msg.verifiedAtSend),
         });
-        relayToTarget(conversationType, targetId, senderPeerId, relayPayload, false);
-        sendJson(ws, { type: 'chat:ack', id: msg.id });
+        const recipientCount = relayToTarget(
+          conversationType,
+          targetId,
+          senderPeerId,
+          relayPayload,
+          false
+        );
+        sendJson(ws, { type: 'chat:ack', id: msg.id, recipientCount });
         return;
       }
 

@@ -33,6 +33,8 @@ pub fn run() {
             client::rust_ws_send_binary,
             client::rust_ws_status,
             client::rust_probe_host,
+            client::rust_log_packet_trace,
+            client::rust_get_packet_traces,
         ])
         .run(tauri::generate_context!())
         .expect("Gagal menjalankan aplikasi Tauri LokaKirim");

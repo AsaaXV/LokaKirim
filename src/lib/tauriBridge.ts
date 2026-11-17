@@ -241,3 +241,37 @@ export async function subscribeRustWsEvents(handlers: {
   };
 }
 
+export interface RustPacketTraceEntryDto {
+  seq: number;
+  tsMs: number;
+  level: string;
+  target: string;
+  event: string;
+  msgId?: string | null;
+  convId?: string | null;
+  details: string;
+}
+
+export async function rustLogPacketTrace(params: {
+  level: string;
+  target: string;
+  event: string;
+  msgId?: string;
+  convId?: string;
+  details: string;
+}): Promise<void> {
+  return invoke<void>('rust_log_packet_trace', {
+    level: params.level,
+    target: params.target,
+    event: params.event,
+    msgId: params.msgId ?? null,
+    convId: params.convId ?? null,
+    details: params.details,
+  });
+}
+
+export async function rustGetPacketTraces(): Promise<RustPacketTraceEntryDto[]> {
+  return invoke<RustPacketTraceEntryDto[]>('rust_get_packet_traces');
+}
+
+

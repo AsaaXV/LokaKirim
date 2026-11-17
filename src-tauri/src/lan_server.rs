@@ -304,7 +304,7 @@ async fn relay_to_target(
     target_id: &str,
     sender_id: &str,
     msg: Message,
-) {
+) -> usize {
     let recipients: Vec<mpsc::UnboundedSender<Message>> = {
         let mut guard = state.inner.write().await;
         if conversation_type == "dm" {
@@ -340,9 +340,13 @@ async fn relay_to_target(
         }
     };
 
+    let mut delivered = 0usize;
     for tx in recipients {
-        let _ = tx.send(msg.clone());
+        if tx.send(msg.clone()).is_ok() {
+            delivered += 1;
+        }
     }
+    delivered
 }
 
 async fn handle_socket(socket: WebSocket, state: AppState) {
@@ -673,7 +677,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             "encryptedPayload": parsed.get("encryptedPayload").cloned().unwrap_or(Value::Null),
                             "verifiedAtSend": parsed.get("verifiedAtSend").and_then(|v| v.as_bool()).unwrap_or(false),
                         });
-                        relay_to_target(
+                        let recipient_count = relay_to_target(
                             &state,
                             conversation_type,
                             target_id,
@@ -681,11 +685,17 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                             Message::Text(relay_payload.to_string().into()),
                         )
                         .await;
+                        if recipient_count == 0 {
+                            eprintln!(
+                                "WARN  host::relay: chat_zero_recipients {{ conv_type={conversation_type} target_id={target_id} sender={sender_peer_id} }}"
+                            );
+                        }
                         send_json_tx(
                             &tx,
                             &json!({
                                 "type": "chat:ack",
                                 "id": msg_id,
+                                "recipientCount": recipient_count,
                             }),
                         );
                     }
@@ -928,7 +938,7 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                 .unwrap_or(false);
             if is_same_conn {
                 guard.clients.remove(&peer_id);
-                let mut ended = Vec::new();
+                let mut ended_peer_calls = Vec::new();
                 guard.calls.retain(|_, call| {
                     if call.caller_id == peer_id || call.callee_id == peer_id {
                         let other_id = if call.caller_id == peer_id {
@@ -936,14 +946,21 @@ async fn handle_socket(socket: WebSocket, state: AppState) {
                         } else {
                             call.caller_id.clone()
                         };
-                        if let Some(other_client) = guard.clients.get(&other_id) {
-                            ended.push((other_client.tx.clone(), call.call_id.clone()));
-                        }
+                        ended_peer_calls.push((other_id, call.call_id.clone()));
                         false
                     } else {
                         true
                     }
                 });
+                let ended: Vec<_> = ended_peer_calls
+                    .into_iter()
+                    .filter_map(|(other_id, call_id)| {
+                        guard
+                            .clients
+                            .get(&other_id)
+                            .map(|other_client| (other_client.tx.clone(), call_id))
+                    })
+                    .collect();
                 ACTIVE_CALL_COUNTER.store(guard.calls.len(), Ordering::Relaxed);
                 (true, ended)
             } else {

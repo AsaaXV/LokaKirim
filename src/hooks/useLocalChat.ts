@@ -24,6 +24,8 @@ import {
   getRustLanInfo,
   isTauriRuntime,
   rustGetCallCapabilities,
+  rustGetPacketTraces,
+  rustLogPacketTrace,
   rustProbeHost,
   rustWsConnect,
   rustWsDisconnect,
@@ -32,7 +34,17 @@ import {
   subscribeRustWsEvents,
   type RustCallCapabilitiesDto,
   type RustHostProbeResultDto,
+  type RustPacketTraceEntryDto,
 } from '../lib/tauriBridge';
+import {
+  err,
+  ok,
+  PacketErrorCode,
+  PacketTracer,
+  TraceTarget,
+  type PacketResult,
+  type PacketTraceEntry,
+} from '../lib/packetTracer';
 import { CallMediaEngine } from '../lib/callEngine';
 import { ringtone } from '../lib/ringtone';
 import {
@@ -146,6 +158,8 @@ export function useLocalChat() {
     lastPongAt: null,
     wsEndpoint: '',
   });
+  const [packetTraces, setPacketTraces] = useState<PacketTraceEntry[]>([]);
+  const [lastSyncFailure, setLastSyncFailure] = useState<PacketTraceEntry | null>(null);
 
   const wsRef = useRef<WebSocket | null>(null);
   const rustWsConnectedRef = useRef<boolean>(false);
@@ -192,6 +206,40 @@ export function useLocalChat() {
   const reconnectAttemptRef = useRef(0);
   const lastPingSentAtRef = useRef<number | null>(null);
   const unmountedRef = useRef(false);
+  const tracerRef = useRef<PacketTracer | null>(null);
+
+  if (!tracerRef.current) {
+    tracerRef.current = new PacketTracer({
+      onRustForward: (entry) => {
+        if (!isTauriApp) return;
+        const fieldPairs = entry.fields
+          ? Object.entries(entry.fields)
+              .filter(([, v]) => v !== undefined)
+              .map(([k, v]) => `${k}=${String(v)}`)
+          : [];
+        const details = [
+          entry.errorCode ? `err=${entry.errorCode}` : null,
+          entry.elapsedMs !== undefined ? `elapsed_ms=${entry.elapsedMs}` : null,
+          ...fieldPairs,
+        ]
+          .filter(Boolean)
+          .join(' ');
+        void rustLogPacketTrace({
+          level: entry.level,
+          target: entry.target,
+          event: entry.event,
+          msgId: entry.msgId,
+          convId: entry.convId,
+          details,
+        }).catch(() => {});
+      },
+      onUpdate: (entries, failure) => {
+        if (unmountedRef.current) return;
+        setPacketTraces(entries);
+        setLastSyncFailure(failure);
+      },
+    });
+  }
 
   useEffect(() => {
     activeTargetRef.current = activeTarget;
@@ -226,11 +274,25 @@ export function useLocalChat() {
         .then((caps) => setRustCallCapabilities(caps))
         .catch(() => {});
     }
+    const debugHandle = {
+      getReport: (limit = 60) => tracerRef.current?.formatReport(limit) || '',
+      getEntries: () => tracerRef.current?.snapshot() || [],
+      getLastFailure: () => tracerRef.current?.getLastFailure() || null,
+      getRustEntries: async () => (isTauriApp ? rustGetPacketTraces() : []),
+      clear: () => tracerRef.current?.clear(),
+    };
+    const win = window as unknown as Record<string, unknown>;
+    win.__LOKAKIRIM_TRACE__ = debugHandle;
+
     return () => {
       ringtone.stop();
       if (callRingTimeoutRef.current) window.clearTimeout(callRingTimeoutRef.current);
       if (callEndedTimerRef.current) window.clearTimeout(callEndedTimerRef.current);
       callEngineRef.current?.destroy();
+      tracerRef.current?.destroy();
+      if (win.__LOKAKIRIM_TRACE__ === debugHandle) {
+        delete win.__LOKAKIRIM_TRACE__;
+      }
     };
   }, [isTauriApp]);
 
@@ -457,7 +519,16 @@ export function useLocalChat() {
         if (!rustWsConnectedRef.current) return false;
         try {
           return await rustWsSendText(encoded);
-        } catch {
+        } catch (ipcErr) {
+          tracerRef.current?.error(
+            TraceTarget.TransportRustWs,
+            'rust_ipc_send_text_failed',
+            PacketErrorCode.RustIpcError,
+            {
+              bytes: encoded.length,
+              err_msg: ipcErr instanceof Error ? ipcErr.message : String(ipcErr),
+            }
+          );
           return false;
         }
       }
@@ -466,7 +537,16 @@ export function useLocalChat() {
         try {
           ws.send(encoded);
           return true;
-        } catch {
+        } catch (wsErr) {
+          tracerRef.current?.error(
+            TraceTarget.TransportBrowserWs,
+            'browser_ws_send_failed',
+            PacketErrorCode.SendRejected,
+            {
+              bytes: encoded.length,
+              err_msg: wsErr instanceof Error ? wsErr.message : String(wsErr),
+            }
+          );
           return false;
         }
       }
@@ -531,6 +611,47 @@ export function useLocalChat() {
       return entry?.aesKey || null;
     },
     [ensureDmKey, ensureRoomKeyLocal]
+  );
+
+  const resolveConversationKeyResult = useCallback(
+    async (
+      conversationType: 'room' | 'dm',
+      peerOrRoomId: string,
+      msgId?: string
+    ): Promise<PacketResult<Uint8Array>> => {
+      const convId = makeConversationId(conversationType, peerOrRoomId);
+      const aesKey = await getConversationKey(conversationType, peerOrRoomId);
+      if (!aesKey) {
+        const onlinePeerIds = peersRef.current
+          .filter((p) => p.online)
+          .map((p) => p.peerId)
+          .slice(0, 5)
+          .join(',');
+        const failure = {
+          code: PacketErrorCode.KeyMissing,
+          message:
+            conversationType === 'dm'
+              ? `Peer key unavailable for DM target ${peerOrRoomId}`
+              : `Room AES key unavailable for ${peerOrRoomId}`,
+          fields: {
+            conv_type: conversationType,
+            target_id: peerOrRoomId,
+            peers_online: peersRef.current.length,
+            online_peers: onlinePeerIds || 'none',
+          },
+        };
+        tracerRef.current?.warn(
+          TraceTarget.SyncKey,
+          'conversation_key_missing',
+          failure.code,
+          failure.fields,
+          { msgId, convId }
+        );
+        return err(failure);
+      }
+      return ok(aesKey);
+    },
+    [getConversationKey]
   );
 
   const ensureCallEngine = useCallback(() => {
@@ -628,15 +749,33 @@ export function useLocalChat() {
     if (!isSocketOpen()) return;
     if (outgoingQueueRef.current.length === 0) return;
 
+    const transport = isTauriApp ? 'rust-ws' : 'browser-ws';
+    const activeHost = hostUrlRef.current || LOCAL_RUST_HOST_URL;
+    tracerRef.current?.info(TraceTarget.SyncQueue, 'queue_flush_begin', {
+      queued_count: outgoingQueueRef.current.length,
+      transport,
+      host_url: activeHost,
+      peers_online: peersRef.current.length,
+    });
+
     const remaining: typeof outgoingQueueRef.current = [];
+    let sentCount = 0;
+
     for (const item of outgoingQueueRef.current) {
+      const convId = makeConversationId(item.conversationType, item.targetId);
       try {
-        const aesKey = await getConversationKey(item.conversationType, item.targetId);
-        if (!aesKey) {
+        const keyRes = await resolveConversationKeyResult(
+          item.conversationType,
+          item.targetId,
+          item.id
+        );
+        if (!keyRes.ok) {
           remaining.push(item);
           continue;
         }
-        const encryptedPayload = await encryptTextAsync(aesKey, item.text);
+        const encStarted = performance.now();
+        const encryptedPayload = await encryptTextAsync(keyRes.value, item.text);
+        const encElapsed = Math.round(performance.now() - encStarted);
         const sent = await sendJsonReliable({
           type: 'chat:message',
           id: item.id,
@@ -649,16 +788,53 @@ export function useLocalChat() {
         });
 
         if (!sent) {
+          tracerRef.current?.warn(
+            TraceTarget.SyncQueue,
+            'queued_packet_send_rejected',
+            PacketErrorCode.SendRejected,
+            {
+              transport,
+              socket_open: isSocketOpen(),
+              host_url: activeHost,
+              enc_ms: encElapsed,
+            },
+            { msgId: item.id, convId }
+          );
           remaining.push(item);
+        } else {
+          sentCount += 1;
+          tracerRef.current?.info(
+            TraceTarget.SyncQueue,
+            'queued_packet_dispatched',
+            {
+              transport,
+              host_url: activeHost,
+              enc_ms: encElapsed,
+            },
+            { msgId: item.id, convId }
+          );
         }
-      } catch {
+      } catch (flushErr) {
+        tracerRef.current?.error(
+          TraceTarget.SyncEncrypt,
+          'queued_packet_encrypt_failed',
+          PacketErrorCode.EncryptFailed,
+          {
+            err_msg: flushErr instanceof Error ? flushErr.message : String(flushErr),
+          },
+          { msgId: item.id, convId }
+        );
         remaining.push(item);
       }
     }
 
     outgoingQueueRef.current = remaining;
     setTelemetry((prev) => ({ ...prev, queuedCount: remaining.length }));
-  }, [getConversationKey, isSocketOpen, sendJsonReliable]);
+    tracerRef.current?.info(TraceTarget.SyncQueue, 'queue_flush_done', {
+      sent_count: sentCount,
+      remaining_count: remaining.length,
+    });
+  }, [isSocketOpen, isTauriApp, resolveConversationKeyResult, sendJsonReliable]);
 
   const handleIncomingBinaryChunk = useCallback(
     async (arrayBuffer: ArrayBuffer) => {
@@ -818,9 +994,19 @@ export function useLocalChat() {
       }
     };
 
+    const transportTarget = isTauriApp
+      ? TraceTarget.TransportRustWs
+      : TraceTarget.TransportBrowserWs;
+
     const handleSocketOpen = (wsUrl: string) => {
       if (cancelled) return;
       reconnectAttemptRef.current = 0;
+
+      tracerRef.current?.info(transportTarget, 'socket_open_sending_hello', {
+        ws_url: wsUrl,
+        peer_id: identity.peerId,
+        queued_count: outgoingQueueRef.current.length,
+      });
 
       void sendJsonReliable({
         type: 'hello',
@@ -857,7 +1043,7 @@ export function useLocalChat() {
       }, 2000);
     };
 
-    const handleSocketClose = () => {
+    const handleSocketClose = (reason = 'closed') => {
       if (pingIntervalRef.current) {
         window.clearInterval(pingIntervalRef.current);
         pingIntervalRef.current = null;
@@ -872,6 +1058,18 @@ export function useLocalChat() {
 
       reconnectAttemptRef.current += 1;
       const delay = Math.min(8000, 1000 * Math.pow(2, reconnectAttemptRef.current - 1));
+      tracerRef.current?.warn(
+        transportTarget,
+        'socket_disconnected_scheduling_reconnect',
+        PacketErrorCode.SocketClosed,
+        {
+          attempt: reconnectAttemptRef.current,
+          delay_ms: delay,
+          host_url: hostUrl || LOCAL_RUST_HOST_URL,
+          reason,
+          queued_count: outgoingQueueRef.current.length,
+        }
+      );
       setTelemetry((prev) => ({
         ...prev,
         quality: 'reconnecting',
@@ -931,6 +1129,12 @@ export function useLocalChat() {
         setPeers(incomingPeers);
         setRooms(incomingRooms);
         await saveCachedRooms(incomingRooms);
+
+        tracerRef.current?.info(TraceTarget.SyncKey, 'host_init_synced', {
+          peers_online: incomingPeers.filter((p) => p.online).length,
+          rooms_count: incomingRooms.length,
+          host_url: hostUrl || LOCAL_RUST_HOST_URL,
+        });
 
         // If activeTarget points to a custom room missing on the host, ensure it exists or switch cleanly
         if (
@@ -1005,6 +1209,12 @@ export function useLocalChat() {
         peersRef.current = nextPeers;
         setPeers(nextPeers);
 
+        tracerRef.current?.debug(TraceTarget.SyncKey, 'peer_presence_updated', {
+          peer_id: peer.peerId,
+          online: peer.online,
+          peers_total: nextPeers.length,
+        });
+
         if (peer.peerId !== identity.peerId) {
           await ensureDmKey(peer);
           await flushQueuedMessages();
@@ -1017,6 +1227,10 @@ export function useLocalChat() {
         const nextPeers = peersRef.current.filter((p) => p.peerId !== leftId);
         peersRef.current = nextPeers;
         setPeers(nextPeers);
+        tracerRef.current?.debug(TraceTarget.SyncKey, 'peer_left', {
+          peer_id: leftId,
+          peers_total: nextPeers.length,
+        });
         return;
       }
 
@@ -1040,7 +1254,20 @@ export function useLocalChat() {
           roomKeyEntry = await ensureRoomKeyLocal(roomId);
         }
         const requesterPeer = peersRef.current.find((p) => p.peerId === requesterPeerId);
-        if (!roomKeyEntry || !requesterPeer) return;
+        if (!roomKeyEntry || !requesterPeer) {
+          tracerRef.current?.warn(
+            TraceTarget.SyncKey,
+            'room_key_request_ignored',
+            PacketErrorCode.KeyMissing,
+            {
+              room_id: roomId,
+              requester: requesterPeerId,
+              has_room_key: Boolean(roomKeyEntry),
+              has_requester_peer: Boolean(requesterPeer),
+            }
+          );
+          return;
+        }
 
         const dmEntry = await ensureDmKey(requesterPeer);
         if (!dmEntry) return;
@@ -1051,6 +1278,10 @@ export function useLocalChat() {
           targetPeerId: requesterPeerId,
           encryptedKeyPayload: wrapped,
         });
+        tracerRef.current?.debug(TraceTarget.SyncKey, 'room_key_shared_to_peer', {
+          room_id: roomId,
+          target_peer: requesterPeerId,
+        });
         return;
       }
 
@@ -1059,7 +1290,15 @@ export function useLocalChat() {
         const fromPeerId = String(msg.fromPeerId);
         const encryptedKeyPayload = msg.encryptedKeyPayload as EncryptedPayload;
         const fromPeer = peersRef.current.find((p) => p.peerId === fromPeerId);
-        if (!fromPeer) return;
+        if (!fromPeer) {
+          tracerRef.current?.warn(
+            TraceTarget.SyncKey,
+            'room_key_share_unknown_sender',
+            PacketErrorCode.KeyMissing,
+            { room_id: roomId, from_peer: fromPeerId }
+          );
+          return;
+        }
 
         try {
           const dmEntry = await ensureDmKey(fromPeer);
@@ -1075,16 +1314,37 @@ export function useLocalChat() {
           syncedRoomForHostRef.current.add(`${currentHostKey}::${roomId}`);
           await saveRoomKeyRecord(roomId, rawBase64, safetyCode);
           setRoomSafetyCodes((prev) => ({ ...prev, [roomId]: safetyCode }));
+          tracerRef.current?.info(TraceTarget.SyncKey, 'room_key_synchronized', {
+            room_id: roomId,
+            from_peer: fromPeerId,
+            safety_code: safetyCode,
+          });
           await retryDecryptRoomMessages(roomId, keyBytes);
           await flushQueuedMessages();
-        } catch {
-          // ignore failed unwrap
+        } catch (unwrapErr) {
+          tracerRef.current?.warn(
+            TraceTarget.SyncDecrypt,
+            'room_key_unwrap_failed',
+            PacketErrorCode.DecryptMismatch,
+            {
+              room_id: roomId,
+              from_peer: fromPeerId,
+              err_msg: unwrapErr instanceof Error ? unwrapErr.message : String(unwrapErr),
+            }
+          );
         }
         return;
       }
 
       if (type === 'chat:ack') {
         const ackId = String(msg.id);
+        const recipientCount =
+          typeof msg.recipientCount === 'number' ? msg.recipientCount : undefined;
+        tracerRef.current?.finishMessageSpan(ackId, recipientCount, {
+          host_url: hostUrl || LOCAL_RUST_HOST_URL,
+          transport: isTauriApp ? 'rust-ws' : 'browser-ws',
+        });
+
         let ackedMsg: ChatMessageRecord | null = null;
         setMessages((prev) =>
           prev.map((m) => {
@@ -1113,15 +1373,41 @@ export function useLocalChat() {
         let decryptedText = '[Pesan terenkripsi tidak dapat didekripsi]';
         let encryptedOk = false;
 
-        if (aesKey && msg.encryptedPayload) {
+        if (!aesKey) {
+          tracerRef.current?.warn(
+            TraceTarget.SyncDecrypt,
+            'incoming_key_missing',
+            PacketErrorCode.KeyMissing,
+            { conv_type: conversationType, from_peer: senderId, target_id: convTargetId },
+            { msgId, convId: conversationId }
+          );
+        } else if (msg.encryptedPayload) {
           try {
             decryptedText = await decryptTextAsync(
               aesKey,
               msg.encryptedPayload as EncryptedPayload
             );
             encryptedOk = true;
-          } catch {
+            tracerRef.current?.debug(
+              TraceTarget.SyncDecrypt,
+              'incoming_packet_decrypted',
+              { conv_type: conversationType, from_peer: senderId },
+              msgId
+            );
+          } catch (decErr) {
             decryptedText = '[Menyelaraskan kunci ruang enkripsi...]';
+            tracerRef.current?.warn(
+              TraceTarget.SyncDecrypt,
+              'incoming_decrypt_mismatch',
+              PacketErrorCode.DecryptMismatch,
+              {
+                conv_type: conversationType,
+                from_peer: senderId,
+                target_id: convTargetId,
+                err_msg: decErr instanceof Error ? decErr.message : String(decErr),
+              },
+              { msgId, convId: conversationId }
+            );
             if (conversationType === 'room') {
               undecryptedPayloadsRef.current.set(msgId, {
                 conversationType,
@@ -1365,6 +1651,12 @@ export function useLocalChat() {
 
       const wsUrl = buildWsEndpoint(hostUrl);
 
+      tracerRef.current?.info(transportTarget, 'socket_connecting', {
+        ws_url: wsUrl,
+        host_url: hostUrl || LOCAL_RUST_HOST_URL,
+        attempt: reconnectAttemptRef.current + 1,
+      });
+
       setTelemetry((prev) => ({
         ...prev,
         quality: reconnectAttemptRef.current > 0 ? 'reconnecting' : prev.quality,
@@ -1379,8 +1671,17 @@ export function useLocalChat() {
               rustActiveConnIdRef.current = connId;
             }
           })
-          .catch(() => {
-            handleSocketClose();
+          .catch((connErr) => {
+            tracerRef.current?.error(
+              TraceTarget.TransportRustWs,
+              'rust_ws_connect_invoke_failed',
+              PacketErrorCode.RustIpcError,
+              {
+                ws_url: wsUrl,
+                err_msg: connErr instanceof Error ? connErr.message : String(connErr),
+              }
+            );
+            handleSocketClose('rust_ws_connect_invoke_failed');
           });
         return;
       }
@@ -1401,11 +1702,17 @@ export function useLocalChat() {
         await handleIncomingJsonText(String(event.data));
       };
 
-      ws.onclose = () => {
-        handleSocketClose();
+      ws.onclose = (ev) => {
+        handleSocketClose(`code=${ev.code}`);
       };
 
       ws.onerror = () => {
+        tracerRef.current?.error(
+          TraceTarget.TransportBrowserWs,
+          'browser_ws_transport_error',
+          PacketErrorCode.SocketClosed,
+          { ws_url: wsUrl }
+        );
         setTelemetry((prev) => ({
           ...prev,
           quality: 'disconnected',
@@ -1436,7 +1743,7 @@ export function useLocalChat() {
           },
           onClose: (payload) => {
             if (cancelled || payload.connId !== rustActiveConnIdRef.current) return;
-            handleSocketClose();
+            handleSocketClose(payload.reason);
           },
         });
       }
@@ -1480,38 +1787,62 @@ export function useLocalChat() {
 
   const probeHost = useCallback(
     async (targetUrl: string): Promise<RustHostProbeResultDto> => {
+      let result: RustHostProbeResultDto;
       if (isTauriApp) {
-        return rustProbeHost(targetUrl);
+        result = await rustProbeHost(targetUrl);
+      } else {
+        const started = performance.now();
+        try {
+          const res = await fetch(`${targetUrl}/api/health`, {
+            signal: AbortSignal.timeout(3000),
+          });
+          const data = (await res.json()) as {
+            ok?: boolean;
+            peersOnline?: number;
+            activeCalls?: number;
+            engine?: string;
+          };
+          result = {
+            ok: Boolean(data.ok),
+            latencyMs: Math.max(1, Math.round(performance.now() - started)),
+            peersOnline: data.peersOnline ?? 0,
+            activeCalls: data.activeCalls ?? 0,
+            engine: data.engine || 'node-ws',
+            error: data.ok ? null : 'Host tidak merespons sebagai server LokaKirim',
+          };
+        } catch (probeErr) {
+          result = {
+            ok: false,
+            latencyMs: Math.round(performance.now() - started),
+            peersOnline: 0,
+            activeCalls: 0,
+            engine: 'fetch',
+            error: probeErr instanceof Error ? probeErr.message : 'Host tidak dapat dijangkau',
+          };
+        }
       }
-      const started = performance.now();
-      try {
-        const res = await fetch(`${targetUrl}/api/health`, {
-          signal: AbortSignal.timeout(3000),
+
+      if (result.ok) {
+        tracerRef.current?.info(TraceTarget.HostProbe, 'host_probe_ok', {
+          target_url: targetUrl,
+          latency_ms: result.latencyMs,
+          peers_online: result.peersOnline,
+          engine: result.engine,
         });
-        const data = (await res.json()) as {
-          ok?: boolean;
-          peersOnline?: number;
-          activeCalls?: number;
-          engine?: string;
-        };
-        return {
-          ok: Boolean(data.ok),
-          latencyMs: Math.max(1, Math.round(performance.now() - started)),
-          peersOnline: data.peersOnline ?? 0,
-          activeCalls: data.activeCalls ?? 0,
-          engine: data.engine || 'node-ws',
-          error: data.ok ? null : 'Host tidak merespons sebagai server LokaKirim',
-        };
-      } catch (err) {
-        return {
-          ok: false,
-          latencyMs: Math.round(performance.now() - started),
-          peersOnline: 0,
-          activeCalls: 0,
-          engine: 'fetch',
-          error: err instanceof Error ? err.message : 'Host tidak dapat dijangkau',
-        };
+      } else {
+        tracerRef.current?.warn(
+          TraceTarget.HostProbe,
+          'host_probe_failed',
+          PacketErrorCode.SocketClosed,
+          {
+            target_url: targetUrl,
+            latency_ms: result.latencyMs,
+            engine: result.engine,
+            err_msg: result.error || 'unknown',
+          }
+        );
       }
+      return result;
     },
     [isTauriApp]
   );
@@ -1613,6 +1944,32 @@ export function useLocalChat() {
       const msgId = randomUuid();
       const timestamp = Date.now();
       const conversationId = makeConversationId(target.type, target.id);
+      const transport = isTauriApp ? 'rust-ws' : 'browser-ws';
+      const transportTarget = isTauriApp
+        ? TraceTarget.TransportRustWs
+        : TraceTarget.TransportBrowserWs;
+      const activeHost = hostUrlRef.current || LOCAL_RUST_HOST_URL;
+
+      tracerRef.current?.startMessageSpan(
+        msgId,
+        conversationId,
+        {
+          host_url: activeHost,
+          transport,
+          target_type: target.type,
+          target_id: target.id,
+          peers_online: peersRef.current.length,
+          socket_open: isSocketOpen(),
+        },
+        (elapsedMs) => ({
+          elapsed_ms: elapsedMs,
+          socket_open: isSocketOpen(),
+          transport,
+          host_url: hostUrlRef.current || LOCAL_RUST_HOST_URL,
+          queued_count: outgoingQueueRef.current.length,
+          peers_online: peersRef.current.length,
+        })
+      );
 
       const optimistic: ChatMessageRecord = {
         id: msgId,
@@ -1629,7 +1986,7 @@ export function useLocalChat() {
 
       await appendMessageIdempotent(optimistic, false);
 
-      const queueForRetry = () => {
+      const queueForRetry = (reasonCode: PacketErrorCode) => {
         if (!outgoingQueueRef.current.some((q) => q.id === msgId)) {
           outgoingQueueRef.current.push({
             id: msgId,
@@ -1642,17 +1999,55 @@ export function useLocalChat() {
             ...prev,
             queuedCount: outgoingQueueRef.current.length,
           }));
+          tracerRef.current?.warn(
+            TraceTarget.SyncQueue,
+            'packet_enqueued_for_retry',
+            reasonCode,
+            {
+              queued_count: outgoingQueueRef.current.length,
+              transport,
+              host_url: activeHost,
+            },
+            { msgId, convId: conversationId }
+          );
         }
       };
 
       try {
-        const aesKey = await getConversationKey(target.type, target.id);
-        if (!aesKey || !isSocketOpen()) {
-          queueForRetry();
+        const keyResult = await resolveConversationKeyResult(target.type, target.id, msgId);
+        if (!keyResult.ok) {
+          tracerRef.current?.cancelSpan(msgId);
+          queueForRetry(keyResult.error.code);
           return;
         }
 
-        const encryptedPayload = await encryptTextAsync(aesKey, trimmed);
+        if (!isSocketOpen()) {
+          tracerRef.current?.cancelSpan(msgId);
+          tracerRef.current?.warn(
+            transportTarget,
+            'socket_closed_before_dispatch',
+            PacketErrorCode.SocketClosed,
+            {
+              transport,
+              host_url: activeHost,
+              peers_online: peersRef.current.length,
+            },
+            { msgId, convId: conversationId }
+          );
+          queueForRetry(PacketErrorCode.SocketClosed);
+          return;
+        }
+
+        const encStarted = performance.now();
+        const encryptedPayload = await encryptTextAsync(keyResult.value, trimmed);
+        const encMs = Math.round(performance.now() - encStarted);
+        tracerRef.current?.debug(
+          TraceTarget.SyncEncrypt,
+          'payload_encrypted',
+          { elapsed_ms: encMs, ciphertext_len: encryptedPayload.ciphertext.length },
+          msgId
+        );
+
         const sent = await sendJsonReliable({
           type: 'chat:message',
           id: msgId,
@@ -1668,16 +2063,53 @@ export function useLocalChat() {
         });
 
         if (!sent) {
-          queueForRetry();
+          tracerRef.current?.cancelSpan(msgId);
+          tracerRef.current?.error(
+            transportTarget,
+            'host_dispatch_rejected',
+            PacketErrorCode.SendRejected,
+            {
+              transport,
+              socket_open: isSocketOpen(),
+              host_url: activeHost,
+            },
+            { msgId, convId: conversationId }
+          );
+          queueForRetry(PacketErrorCode.SendRejected);
+          return;
         }
-      } catch {
-        queueForRetry();
+
+        tracerRef.current?.info(
+          transportTarget,
+          'packet_dispatched_awaiting_ack',
+          {
+            transport,
+            host_url: activeHost,
+            enc_ms: encMs,
+          },
+          { msgId, convId: conversationId }
+        );
+      } catch (sendErr) {
+        tracerRef.current?.cancelSpan(msgId);
+        tracerRef.current?.error(
+          TraceTarget.SyncEncrypt,
+          'packet_encrypt_or_send_threw',
+          PacketErrorCode.EncryptFailed,
+          {
+            err_msg: sendErr instanceof Error ? sendErr.message : String(sendErr),
+            transport,
+            host_url: activeHost,
+          },
+          { msgId, convId: conversationId }
+        );
+        queueForRetry(PacketErrorCode.EncryptFailed);
       }
     },
     [
       appendMessageIdempotent,
-      getConversationKey,
       isSocketOpen,
+      isTauriApp,
+      resolveConversationKeyResult,
       sendJsonReliable,
       verifiedPeers,
       verifiedRooms,
@@ -2104,6 +2536,19 @@ export function useLocalChat() {
     return map;
   }, [messages]);
 
+  const formatPacketTraceReport = useCallback((limit = 60): string => {
+    return tracerRef.current?.formatReport(limit) || '';
+  }, []);
+
+  const clearPacketTraces = useCallback(() => {
+    tracerRef.current?.clear();
+  }, []);
+
+  const getRustPacketTraces = useCallback(async (): Promise<RustPacketTraceEntryDto[]> => {
+    if (!isTauriApp) return [];
+    return rustGetPacketTraces();
+  }, [isTauriApp]);
+
   return {
     identity,
     identityReady,
@@ -2140,6 +2585,11 @@ export function useLocalChat() {
     probeHost,
     switchHostUrl,
     resetHostToLocal,
+    packetTraces,
+    lastSyncFailure,
+    formatPacketTraceReport,
+    clearPacketTraces,
+    getRustPacketTraces,
     callSession,
     localCallStream,
     remoteCallStream,

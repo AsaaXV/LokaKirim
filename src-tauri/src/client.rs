@@ -1,16 +1,111 @@
 use base64::{engine::general_purpose::STANDARD as B64, Engine as _};
 use futures_util::{SinkExt, StreamExt};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicU64, Ordering},
     Mutex, OnceLock,
 };
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use tauri::{AppHandle, Emitter};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
+
+const MAX_RUST_TRACES: usize = 200;
+
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RustPacketTraceEntry {
+    pub seq: u64,
+    pub ts_ms: u64,
+    pub level: String,
+    pub target: String,
+    pub event: String,
+    pub msg_id: Option<String>,
+    pub conv_id: Option<String>,
+    pub details: String,
+}
+
+static PACKET_TRACE_LOG: OnceLock<Mutex<VecDeque<RustPacketTraceEntry>>> = OnceLock::new();
+static NEXT_TRACE_SEQ: AtomicU64 = AtomicU64::new(1);
+
+fn trace_log_slot() -> &'static Mutex<VecDeque<RustPacketTraceEntry>> {
+    PACKET_TRACE_LOG.get_or_init(|| Mutex::new(VecDeque::with_capacity(MAX_RUST_TRACES)))
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+pub fn record_rust_trace(
+    level: &str,
+    target: &str,
+    event: &str,
+    msg_id: Option<&str>,
+    conv_id: Option<&str>,
+    details: &str,
+) {
+    let seq = NEXT_TRACE_SEQ.fetch_add(1, Ordering::Relaxed);
+    let ts_ms = now_ms();
+    eprintln!(
+        "[Rust][#{seq}] {level} {target}: {event}{}{}{}",
+        msg_id.map(|m| format!(" msg_id={m}")).unwrap_or_default(),
+        conv_id.map(|c| format!(" conv_id={c}")).unwrap_or_default(),
+        if details.is_empty() {
+            String::new()
+        } else {
+            format!(" {{ {details} }}")
+        }
+    );
+
+    if let Ok(mut guard) = trace_log_slot().lock() {
+        if guard.len() >= MAX_RUST_TRACES {
+            guard.pop_front();
+        }
+        guard.push_back(RustPacketTraceEntry {
+            seq,
+            ts_ms,
+            level: level.to_string(),
+            target: target.to_string(),
+            event: event.to_string(),
+            msg_id: msg_id.map(str::to_string),
+            conv_id: conv_id.map(str::to_string),
+            details: details.to_string(),
+        });
+    }
+}
+
+#[tauri::command]
+pub fn rust_log_packet_trace(
+    level: String,
+    target: String,
+    event: String,
+    msg_id: Option<String>,
+    conv_id: Option<String>,
+    details: String,
+) {
+    record_rust_trace(
+        &level,
+        &target,
+        &event,
+        msg_id.as_deref(),
+        conv_id.as_deref(),
+        &details,
+    );
+}
+
+#[tauri::command]
+pub fn rust_get_packet_traces() -> Vec<RustPacketTraceEntry> {
+    trace_log_slot()
+        .lock()
+        .map(|g| g.iter().cloned().collect())
+        .unwrap_or_default()
+}
 
 struct ActiveWsConnection {
     conn_id: u64,
@@ -96,12 +191,29 @@ pub async fn rust_ws_connect(app: AppHandle, ws_url: String) -> Result<u64, Stri
     let app_clone = app.clone();
 
     let join_handle = tauri::async_runtime::spawn(async move {
+        record_rust_trace(
+            "INFO",
+            "transport::rust_ws",
+            "ws_connect_begin",
+            None,
+            None,
+            &format!("conn_id={conn_id} url={url_clone}"),
+        );
+
         let connect_res =
             tokio::time::timeout(Duration::from_secs(6), connect_async(url_clone.as_str())).await;
 
         let ws_stream = match connect_res {
             Ok(Ok((stream, _response))) => stream,
             Ok(Err(err)) => {
+                record_rust_trace(
+                    "ERROR",
+                    "transport::rust_ws",
+                    "ws_connect_failed",
+                    None,
+                    None,
+                    &format!("conn_id={conn_id} url={url_clone} err={err}"),
+                );
                 let _ = app_clone.emit(
                     "rust-ws-close",
                     RustWsClosePayload {
@@ -117,6 +229,14 @@ pub async fn rust_ws_connect(app: AppHandle, ws_url: String) -> Result<u64, Stri
                 return;
             }
             Err(_) => {
+                record_rust_trace(
+                    "ERROR",
+                    "transport::rust_ws",
+                    "ws_connect_timeout",
+                    None,
+                    None,
+                    &format!("conn_id={conn_id} url={url_clone} timeout_s=6"),
+                );
                 let _ = app_clone.emit(
                     "rust-ws-close",
                     RustWsClosePayload {
@@ -134,6 +254,15 @@ pub async fn rust_ws_connect(app: AppHandle, ws_url: String) -> Result<u64, Stri
         };
 
         let (mut write, mut read) = ws_stream.split();
+
+        record_rust_trace(
+            "INFO",
+            "transport::rust_ws",
+            "ws_open",
+            None,
+            None,
+            &format!("conn_id={conn_id} url={url_clone}"),
+        );
 
         let _ = app_clone.emit(
             "rust-ws-open",
@@ -196,6 +325,15 @@ pub async fn rust_ws_connect(app: AppHandle, ws_url: String) -> Result<u64, Stri
             }
         }
 
+        record_rust_trace(
+            "WARN",
+            "transport::rust_ws",
+            "ws_closed",
+            None,
+            None,
+            &format!("conn_id={conn_id} reason=\"{close_reason}\""),
+        );
+
         let _ = app_clone.emit(
             "rust-ws-close",
             RustWsClosePayload {
@@ -228,9 +366,28 @@ pub fn rust_ws_send_text(payload: String) -> Result<bool, String> {
         .lock()
         .map_err(|_| "Gagal mengunci status koneksi Rust".to_string())?;
     let Some(conn) = guard.as_ref() else {
+        record_rust_trace(
+            "WARN",
+            "transport::rust_ws",
+            "send_text_no_socket",
+            None,
+            None,
+            &format!("bytes={}", payload.len()),
+        );
         return Ok(false);
     };
-    Ok(conn.tx.send(Message::text(payload)).is_ok())
+    let ok = conn.tx.send(Message::text(payload)).is_ok();
+    if !ok {
+        record_rust_trace(
+            "ERROR",
+            "transport::rust_ws",
+            "send_text_channel_closed",
+            None,
+            None,
+            &format!("conn_id={}", conn.conn_id),
+        );
+    }
+    Ok(ok)
 }
 
 #[tauri::command]
@@ -242,9 +399,28 @@ pub fn rust_ws_send_binary(data_base64: String) -> Result<bool, String> {
         .lock()
         .map_err(|_| "Gagal mengunci status koneksi Rust".to_string())?;
     let Some(conn) = guard.as_ref() else {
+        record_rust_trace(
+            "WARN",
+            "transport::rust_ws",
+            "send_binary_no_socket",
+            None,
+            None,
+            &format!("bytes={}", bytes.len()),
+        );
         return Ok(false);
     };
-    Ok(conn.tx.send(Message::binary(bytes)).is_ok())
+    let ok = conn.tx.send(Message::binary(bytes)).is_ok();
+    if !ok {
+        record_rust_trace(
+            "ERROR",
+            "transport::rust_ws",
+            "send_binary_channel_closed",
+            None,
+            None,
+            &format!("conn_id={}", conn.conn_id),
+        );
+    }
+    Ok(ok)
 }
 
 #[tauri::command]
