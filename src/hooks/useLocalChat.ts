@@ -14,19 +14,33 @@ import {
 } from '../lib/crypto';
 import { detectDeviceLabel, makeConversationId } from '../lib/format';
 import {
+  buildApiUrl,
   buildNetworkInfoUrl,
   buildWsEndpoint,
+  getPrimaryHostUrl,
   getSavedHostUrl,
+  loadSavedHostConfigs,
+  LOCAL_HOST_KEY,
   LOCAL_RUST_HOST_URL,
+  makeRemoteHostKey,
+  makeScopedRoomTargetId,
+  normalizeHostUrl,
+  parseScopedRoomTargetId,
+  saveHostConfigs,
   saveHostUrl,
 } from '../lib/hostConfig';
 import {
   getRustLanInfo,
   isTauriRuntime,
+  rustAddBridge,
   rustGetCallCapabilities,
+  rustGetHostConfig,
   rustGetPacketTraces,
+  rustListBridges,
   rustLogPacketTrace,
   rustProbeHost,
+  rustRemoveBridge,
+  rustSetHostConfig,
   rustWsConnect,
   rustWsDisconnect,
   rustWsSendBinary,
@@ -55,17 +69,21 @@ import {
   loadAllRoomKeyRecords,
   loadCachedRooms,
   loadDeviceIdentity,
+  loadOutgoingQueue,
   loadVerifiedPeers,
   loadVerifiedRooms,
+  removeOutgoingQueueItem,
   removeVerifiedPeer,
   removeVerifiedRoom,
   saveCachedRooms,
   saveDeviceIdentity,
   saveFileBlob,
   saveMessageRecord,
+  saveOutgoingQueueItem,
   saveRoomKeyRecord,
   saveVerifiedPeer,
   saveVerifiedRoom,
+  type QueuedOutgoingMessage,
 } from '../lib/storage';
 import type {
   CallSessionState,
@@ -75,6 +93,10 @@ import type {
   ChatTarget,
   ConnectionQuality,
   EncryptedPayload,
+  HostBridgeInfo,
+  HostConfigInfo,
+  HostConnectionConfig,
+  HostConnectionRuntime,
   LanNetworkInfo,
   NetworkTelemetry,
   PeerInfo,
@@ -106,14 +128,36 @@ interface IncomingTransferState {
 }
 
 export function useLocalChat() {
+  const isTauriApp = useMemo(() => isTauriRuntime(), []);
+
   const [identity, setIdentity] = useState<StoredDeviceIdentity | null>(null);
   const [identityReady, setIdentityReady] = useState(false);
   const [needsOnboarding, setNeedsOnboarding] = useState(false);
+
+  const [savedHosts, setSavedHosts] = useState<HostConnectionConfig[]>(() =>
+    loadSavedHostConfigs(isTauriApp)
+  );
+  const [hostRuntimes, setHostRuntimes] = useState<HostConnectionRuntime[]>(() =>
+    loadSavedHostConfigs(isTauriApp).map((cfg) => ({
+      key: cfg.key,
+      url: cfg.url,
+      label: cfg.label,
+      status: cfg.enabled ? 'reconnecting' : 'disabled',
+      latencyMs: null,
+      peersOnline: 0,
+      enabled: cfg.enabled,
+      isLocal: Boolean(cfg.isLocal),
+    }))
+  );
+  const [localHostConfig, setLocalHostConfig] = useState<HostConfigInfo | null>(null);
+  const [hostBridges, setHostBridges] = useState<HostBridgeInfo[]>([]);
 
   const [peers, setPeers] = useState<PeerInfo[]>([]);
   const [rooms, setRooms] = useState<RoomInfo[]>([
     {
       roomId: DEFAULT_ROOM_ID,
+      wireRoomId: DEFAULT_ROOM_ID,
+      routeHostKey: LOCAL_HOST_KEY,
       name: 'Ruang Utama Wi-Fi',
       createdBy: 'system',
       createdAt: Date.now(),
@@ -135,7 +179,6 @@ export function useLocalChat() {
   const [dmSafetyCodes, setDmSafetyCodes] = useState<Record<string, string>>({});
   const [fileUrls, setFileUrls] = useState<Record<string, string>>({});
   const [lanInfo, setLanInfo] = useState<LanNetworkInfo | null>(null);
-  const isTauriApp = useMemo(() => isTauriRuntime(), []);
   const [hostUrl, setHostUrl] = useState<string>(() => getSavedHostUrl());
 
   const [callSession, setCallSession] = useState<CallSessionState | null>(null);
@@ -161,10 +204,23 @@ export function useLocalChat() {
   const [packetTraces, setPacketTraces] = useState<PacketTraceEntry[]>([]);
   const [lastSyncFailure, setLastSyncFailure] = useState<PacketTraceEntry | null>(null);
 
-  const wsRef = useRef<WebSocket | null>(null);
-  const rustWsConnectedRef = useRef<boolean>(false);
-  const rustActiveConnIdRef = useRef<number>(0);
+  // Multi-host socket & data maps keyed by hostKey
+  const savedHostsRef = useRef<HostConnectionConfig[]>(savedHosts);
+  const hostRuntimesRef = useRef<HostConnectionRuntime[]>(hostRuntimes);
+  const wsMapRef = useRef<Map<string, WebSocket>>(new Map());
+  const rustWsConnectedMapRef = useRef<Map<string, boolean>>(new Map());
+  const rustActiveConnIdMapRef = useRef<Map<string, number>>(new Map());
+  const rustClientConnSeqRef = useRef<number>(0);
+  const authRejectedHostsRef = useRef<Set<string>>(new Set());
+  const peersByHostRef = useRef<Map<string, PeerInfo[]>>(new Map());
+  const roomsByHostRef = useRef<Map<string, RoomInfo[]>>(new Map());
+  const reconnectTimersRef = useRef<Map<string, number>>(new Map());
+  const reconnectAttemptsRef = useRef<Map<string, number>>(new Map());
+  const lastPingSentByHostRef = useRef<Map<string, number>>(new Map());
+  const hostMetaByKeyRef = useRef<Map<string, { hostId?: string; hostLabel?: string }>>(new Map());
+
   const hostUrlRef = useRef<string>(hostUrl);
+  const fileUrlsRef = useRef<Record<string, string>>({});
   const identityRef = useRef<StoredDeviceIdentity | null>(null);
   const peersRef = useRef<PeerInfo[]>([]);
   const roomsRef = useRef<RoomInfo[]>([]);
@@ -186,27 +242,19 @@ export function useLocalChat() {
         conversationType: 'room' | 'dm';
         convTargetId: string;
         encryptedPayload: EncryptedPayload;
+        hostKey: string;
+        wireTargetId: string;
       }
     >
   >(new Map());
   const incomingTransfersRef = useRef<Map<string, IncomingTransferState>>(new Map());
   const cancelledTransfersRef = useRef<Set<string>>(new Set());
-  const outgoingQueueRef = useRef<
-    {
-      id: string;
-      conversationType: 'room' | 'dm';
-      targetId: string;
-      text: string;
-      timestamp: number;
-    }[]
-  >([]);
+  const outgoingQueueRef = useRef<QueuedOutgoingMessage[]>([]);
   const pingIntervalRef = useRef<number | null>(null);
   const queueSweepTimerRef = useRef<number | null>(null);
-  const reconnectTimerRef = useRef<number | null>(null);
-  const reconnectAttemptRef = useRef(0);
-  const lastPingSentAtRef = useRef<number | null>(null);
   const unmountedRef = useRef(false);
   const tracerRef = useRef<PacketTracer | null>(null);
+  const connectHostFnRef = useRef<((cfg: HostConnectionConfig) => void) | null>(null);
 
   if (!tracerRef.current) {
     tracerRef.current = new PacketTracer({
@@ -242,6 +290,14 @@ export function useLocalChat() {
   }
 
   useEffect(() => {
+    savedHostsRef.current = savedHosts;
+  }, [savedHosts]);
+
+  useEffect(() => {
+    hostRuntimesRef.current = hostRuntimes;
+  }, [hostRuntimes]);
+
+  useEffect(() => {
     activeTargetRef.current = activeTarget;
     const convId = makeConversationId(activeTarget.type, activeTarget.id);
     setUnreadCounts((prev) => {
@@ -269,6 +325,10 @@ export function useLocalChat() {
   }, [callSession]);
 
   useEffect(() => {
+    fileUrlsRef.current = fileUrls;
+  }, [fileUrls]);
+
+  useEffect(() => {
     if (isTauriApp) {
       rustGetCallCapabilities()
         .then((caps) => setRustCallCapabilities(caps))
@@ -290,6 +350,13 @@ export function useLocalChat() {
       if (callEndedTimerRef.current) window.clearTimeout(callEndedTimerRef.current);
       callEngineRef.current?.destroy();
       tracerRef.current?.destroy();
+      for (const u of Object.values(fileUrlsRef.current)) {
+        try {
+          URL.revokeObjectURL(u);
+        } catch {
+          // ignore
+        }
+      }
       if (win.__LOKAKIRIM_TRACE__ === debugHandle) {
         delete win.__LOKAKIRIM_TRACE__;
       }
@@ -297,8 +364,8 @@ export function useLocalChat() {
   }, [isTauriApp]);
 
   const refreshLanInfo = useCallback(async () => {
-    const activeHost = hostUrlRef.current;
-    if (isTauriApp && (!activeHost || activeHost === LOCAL_RUST_HOST_URL)) {
+    const activeHost = getPrimaryHostUrl(isTauriApp);
+    if (isTauriApp) {
       try {
         const rustInfo = await getRustLanInfo();
         setLanInfo(rustInfo);
@@ -308,7 +375,7 @@ export function useLocalChat() {
       }
     }
     try {
-      const res = await fetch(buildNetworkInfoUrl(activeHost));
+      const res = await fetch(buildNetworkInfoUrl(isTauriApp ? activeHost : ''));
       if (res.ok) {
         const data = (await res.json()) as LanNetworkInfo;
         setLanInfo(data);
@@ -318,96 +385,181 @@ export function useLocalChat() {
     }
   }, [isTauriApp]);
 
+  const refreshHostManagement = useCallback(async () => {
+    if (isTauriApp) {
+      try {
+        const [cfg, bridges] = await Promise.all([rustGetHostConfig(), rustListBridges()]);
+        setLocalHostConfig(cfg);
+        setHostBridges(bridges);
+        return;
+      } catch {
+        // Fallback HTTP if needed
+      }
+    }
+    try {
+      const [cfgRes, brRes] = await Promise.all([
+        fetch(buildApiUrl('', '/api/host-config')),
+        fetch(buildApiUrl('', '/api/bridges')),
+      ]);
+      if (cfgRes.ok) {
+        const cfg = (await cfgRes.json()) as HostConfigInfo;
+        setLocalHostConfig(cfg);
+      }
+      if (brRes.ok) {
+        const bridges = (await brRes.json()) as HostBridgeInfo[];
+        setHostBridges(bridges);
+      }
+    } catch {
+      // ignore if offline
+    }
+  }, [isTauriApp]);
+
+  const updateHostRuntime = useCallback(
+    (
+      hostKey: string,
+      updater: (prev: HostConnectionRuntime) => HostConnectionRuntime
+    ) => {
+      setHostRuntimes((prev) => {
+        const idx = prev.findIndex((r) => r.key === hostKey);
+        if (idx < 0) return prev;
+        const next = [...prev];
+        next[idx] = updater(prev[idx]);
+        hostRuntimesRef.current = next;
+        return next;
+      });
+    },
+    []
+  );
+
+  // Sync top-level NetworkTelemetry whenever hostRuntimes changes
   useEffect(() => {
-    unmountedRef.current = false;
+    const enabledRuntimes = hostRuntimes.filter((r) => r.enabled);
+    const connectedOnes = enabledRuntimes.filter(
+      (r) => r.status === 'connected' || r.status === 'degraded'
+    );
 
-    async function bootstrap() {
-      const [storedId, storedMessages, storedRoomKeys, storedRooms, vPeers, vRooms] =
-        await Promise.all([
-          loadDeviceIdentity(),
-          loadAllMessages(),
-          loadAllRoomKeyRecords(),
-          loadCachedRooms(),
-          loadVerifiedPeers(),
-          loadVerifiedRooms(),
-        ]);
-
-      if (unmountedRef.current) return;
-
-      for (const rk of storedRoomKeys) {
-        try {
-          const { keyBytes, safetyCode } = await importRoomKeyFromBase64Async(rk.rawBase64);
-          roomKeysRef.current.set(rk.roomId, {
-            aesKey: keyBytes,
-            rawBase64: rk.rawBase64,
-            safetyCode,
-          });
-        } catch {
-          // ignore corrupted key
-        }
-      }
-
-      const codeMap: Record<string, string> = {};
-      for (const [rid, entry] of roomKeysRef.current.entries()) {
-        codeMap[rid] = entry.safetyCode;
-      }
-      setRoomSafetyCodes(codeMap);
-
-      if (storedRooms.length > 0) {
-        setRooms((prev) => {
-          const map = new Map(prev.map((r) => [r.roomId, r]));
-          for (const r of storedRooms) map.set(r.roomId, r);
-          return Array.from(map.values());
-        });
-      }
-
-      const vPeerMap: Record<string, VerifiedPeerRecord> = {};
-      for (const vp of vPeers) vPeerMap[vp.peerId] = vp;
-      setVerifiedPeers(vPeerMap);
-
-      const vRoomMap: Record<string, VerifiedRoomRecord> = {};
-      for (const vr of vRooms) vRoomMap[vr.roomId] = vr;
-      setVerifiedRooms(vRoomMap);
-
-      const urls: Record<string, string> = {};
-      for (const msg of storedMessages) {
-        if (msg.kind === 'file' && msg.file?.blobStored) {
-          const blobRec = await getFileBlob(msg.file.transferId);
-          if (blobRec?.blob) {
-            urls[msg.file.transferId] = URL.createObjectURL(blobRec.blob);
-          }
-        }
-        if (
-          msg.kind === 'file' &&
-          msg.file &&
-          (msg.file.status === 'sending' || msg.file.status === 'receiving')
-        ) {
-          msg.file.status = 'failed';
-          msg.file.errorMessage = 'Terputus sebelum transfer selesai';
-        }
-      }
-
-      setFileUrls(urls);
-      setMessages(storedMessages);
-
-      if (storedId && storedId.privateKeyHex && storedId.publicKeyHex) {
-        identityRef.current = storedId;
-        setIdentity(storedId);
-        setNeedsOnboarding(false);
-      } else {
-        setNeedsOnboarding(true);
-      }
-
-      setIdentityReady(true);
-      refreshLanInfo();
+    let overallQuality: ConnectionQuality = 'disconnected';
+    if (connectedOnes.some((r) => r.status === 'connected')) {
+      overallQuality = 'connected';
+    } else if (connectedOnes.some((r) => r.status === 'degraded')) {
+      overallQuality = 'degraded';
+    } else if (enabledRuntimes.some((r) => r.status === 'reconnecting')) {
+      overallQuality = 'reconnecting';
     }
 
-    bootstrap();
+    const activeEndpoints = connectedOnes
+      .map((r) => r.hostLabel || r.label || r.url)
+      .filter(Boolean);
+    const endpointLabel =
+      activeEndpoints.length > 1
+        ? `${activeEndpoints.length} Host Aktif (${activeEndpoints.join(', ')})`
+        : connectedOnes[0]?.url || enabledRuntimes[0]?.url || '';
 
-    return () => {
-      unmountedRef.current = true;
-    };
-  }, [refreshLanInfo]);
+    setTelemetry((prev) => ({
+      ...prev,
+      quality: overallQuality,
+      wsEndpoint: endpointLabel,
+    }));
+  }, [hostRuntimes]);
+
+  // Recompute unified deduplicated peers + scoped rooms across all connected hosts
+  const recomputeUnifiedTopology = useCallback(() => {
+    const selfId = identityRef.current?.peerId;
+    const orderedHosts = [...savedHostsRef.current].sort((a, b) =>
+      a.key === LOCAL_HOST_KEY ? -1 : b.key === LOCAL_HOST_KEY ? 1 : 0
+    );
+
+    const bestPeers = new Map<string, PeerInfo>();
+    for (const h of orderedHosts) {
+      if (!h.enabled) continue;
+      const hostPeers = peersByHostRef.current.get(h.key) || [];
+      const meta = hostMetaByKeyRef.current.get(h.key);
+      const rtLabel = meta?.hostLabel || h.label;
+
+      for (const p of hostPeers) {
+        if (!p.peerId) continue;
+        const hops = p.hops ?? 0;
+        const existing = bestPeers.get(p.peerId);
+        const shouldReplace =
+          !existing ||
+          hops < (existing.hops ?? 99) ||
+          (hops === (existing.hops ?? 99) &&
+            h.key === LOCAL_HOST_KEY &&
+            existing.routeHostKey !== LOCAL_HOST_KEY);
+
+        if (shouldReplace) {
+          const viaLabel =
+            hops > 0
+              ? p.originHostLabel
+                ? `${p.originHostLabel} · via ${rtLabel}`
+                : `via ${rtLabel}`
+              : undefined;
+          bestPeers.set(p.peerId, {
+            ...p,
+            hops,
+            routeHostKey: h.key,
+            routeHostLabel: rtLabel,
+            viaBridgeLabel: viaLabel,
+          });
+        }
+      }
+    }
+
+    const unifiedPeers = Array.from(bestPeers.values());
+    peersRef.current = unifiedPeers;
+    setPeers(unifiedPeers);
+
+    // Build unified rooms list
+    const multiHostActive = orderedHosts.filter((h) => h.enabled).length > 1;
+    const unifiedRooms: RoomInfo[] = [];
+    const seenIds = new Set<string>();
+
+    for (const h of orderedHosts) {
+      if (!h.enabled) continue;
+      const hostRooms = roomsByHostRef.current.get(h.key) || [];
+      const meta = hostMetaByKeyRef.current.get(h.key);
+      const rtLabel = meta?.hostLabel || h.label;
+
+      for (const r of hostRooms) {
+        const scopedId = makeScopedRoomTargetId(h.key, r.roomId);
+        if (seenIds.has(scopedId)) continue;
+        seenIds.add(scopedId);
+
+        const displayName =
+          r.isDefault && h.key !== LOCAL_HOST_KEY && multiHostActive
+            ? `${r.name} · ${rtLabel}`
+            : r.name;
+
+        unifiedRooms.push({
+          ...r,
+          roomId: scopedId,
+          wireRoomId: r.roomId,
+          name: displayName,
+          routeHostKey: h.key,
+          routeHostLabel: rtLabel,
+          originHostId: r.originHostId || meta?.hostId,
+          originHostLabel: r.originHostLabel || rtLabel,
+        });
+      }
+    }
+
+    if (unifiedRooms.length === 0) {
+      unifiedRooms.push({
+        roomId: DEFAULT_ROOM_ID,
+        wireRoomId: DEFAULT_ROOM_ID,
+        routeHostKey: LOCAL_HOST_KEY,
+        name: 'Ruang Utama Wi-Fi',
+        createdBy: selfId || 'system',
+        createdAt: Date.now(),
+        isDefault: true,
+        memberIds: selfId ? [selfId] : [],
+      });
+    }
+
+    roomsRef.current = unifiedRooms;
+    setRooms(unifiedRooms);
+    void saveCachedRooms(unifiedRooms);
+  }, []);
 
   const ensureDmKey = useCallback(async (peer: PeerInfo) => {
     const existing = dmKeysRef.current.get(peer.peerId);
@@ -425,8 +577,8 @@ export function useLocalChat() {
     return entry;
   }, []);
 
-  const ensureRoomKeyLocal = useCallback(async (roomId: string) => {
-    const existing = roomKeysRef.current.get(roomId);
+  const ensureRoomKeyLocal = useCallback(async (scopedRoomId: string) => {
+    const existing = roomKeysRef.current.get(scopedRoomId);
     if (existing) return existing;
     const created = await generateRoomKeyAsync();
     const entry = {
@@ -434,9 +586,9 @@ export function useLocalChat() {
       rawBase64: created.rawBase64,
       safetyCode: created.safetyCode,
     };
-    roomKeysRef.current.set(roomId, entry);
-    await saveRoomKeyRecord(roomId, created.rawBase64, created.safetyCode);
-    setRoomSafetyCodes((prev) => ({ ...prev, [roomId]: created.safetyCode }));
+    roomKeysRef.current.set(scopedRoomId, entry);
+    await saveRoomKeyRecord(scopedRoomId, created.rawBase64, created.safetyCode);
+    setRoomSafetyCodes((prev) => ({ ...prev, [scopedRoomId]: created.safetyCode }));
     return entry;
   }, []);
 
@@ -486,23 +638,53 @@ export function useLocalChat() {
     []
   );
 
-  const isSocketOpen = useCallback((): boolean => {
-    if (isTauriApp) {
-      return rustWsConnectedRef.current;
-    }
-    const ws = wsRef.current;
-    return Boolean(ws && ws.readyState === WebSocket.OPEN);
-  }, [isTauriApp]);
+  const isHostSocketOpen = useCallback(
+    (hostKey: string): boolean => {
+      if (isTauriApp) {
+        return Boolean(rustWsConnectedMapRef.current.get(hostKey));
+      }
+      const ws = wsMapRef.current.get(hostKey);
+      return Boolean(ws && ws.readyState === WebSocket.OPEN);
+    },
+    [isTauriApp]
+  );
 
-  const sendJsonRaw = useCallback(
-    (payload: unknown): boolean => {
+  const getFallbackConnectedHostKey = useCallback((): string => {
+    if (isHostSocketOpen(LOCAL_HOST_KEY)) return LOCAL_HOST_KEY;
+    for (const h of savedHostsRef.current) {
+      if (h.enabled && isHostSocketOpen(h.key)) return h.key;
+    }
+    return savedHostsRef.current.find((h) => h.enabled)?.key || LOCAL_HOST_KEY;
+  }, [isHostSocketOpen]);
+
+  const isAnySocketOpen = useCallback((): boolean => {
+    for (const h of savedHostsRef.current) {
+      if (h.enabled && isHostSocketOpen(h.key)) return true;
+    }
+    return false;
+  }, [isHostSocketOpen]);
+
+  const resolvePeerHostKey = useCallback(
+    (peerId: string): string => {
+      const p = peersRef.current.find((item) => item.peerId === peerId);
+      if (p?.routeHostKey && isHostSocketOpen(p.routeHostKey)) {
+        return p.routeHostKey;
+      }
+      if (p?.routeHostKey) return p.routeHostKey;
+      return getFallbackConnectedHostKey();
+    },
+    [getFallbackConnectedHostKey, isHostSocketOpen]
+  );
+
+  const sendJsonRawToHost = useCallback(
+    (hostKey: string, payload: unknown): boolean => {
       const encoded = JSON.stringify(payload);
       if (isTauriApp) {
-        if (!rustWsConnectedRef.current) return false;
-        void rustWsSendText(encoded).catch(() => {});
+        if (!rustWsConnectedMapRef.current.get(hostKey)) return false;
+        void rustWsSendText(hostKey, encoded).catch(() => {});
         return true;
       }
-      const ws = wsRef.current;
+      const ws = wsMapRef.current.get(hostKey);
       if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(encoded);
         return true;
@@ -512,19 +694,20 @@ export function useLocalChat() {
     [isTauriApp]
   );
 
-  const sendJsonReliable = useCallback(
-    async (payload: unknown): Promise<boolean> => {
+  const sendJsonReliableToHost = useCallback(
+    async (hostKey: string, payload: unknown): Promise<boolean> => {
       const encoded = JSON.stringify(payload);
       if (isTauriApp) {
-        if (!rustWsConnectedRef.current) return false;
+        if (!rustWsConnectedMapRef.current.get(hostKey)) return false;
         try {
-          return await rustWsSendText(encoded);
+          return await rustWsSendText(hostKey, encoded);
         } catch (ipcErr) {
           tracerRef.current?.error(
             TraceTarget.TransportRustWs,
             'rust_ipc_send_text_failed',
             PacketErrorCode.RustIpcError,
             {
+              host_key: hostKey,
               bytes: encoded.length,
               err_msg: ipcErr instanceof Error ? ipcErr.message : String(ipcErr),
             }
@@ -532,7 +715,7 @@ export function useLocalChat() {
           return false;
         }
       }
-      const ws = wsRef.current;
+      const ws = wsMapRef.current.get(hostKey);
       if (ws && ws.readyState === WebSocket.OPEN) {
         try {
           ws.send(encoded);
@@ -543,6 +726,7 @@ export function useLocalChat() {
             'browser_ws_send_failed',
             PacketErrorCode.SendRejected,
             {
+              host_key: hostKey,
               bytes: encoded.length,
               err_msg: wsErr instanceof Error ? wsErr.message : String(wsErr),
             }
@@ -555,15 +739,15 @@ export function useLocalChat() {
     [isTauriApp]
   );
 
-  const sendBinaryRaw = useCallback(
-    (packet: ArrayBuffer): boolean => {
+  const sendBinaryRawToHost = useCallback(
+    (hostKey: string, packet: ArrayBuffer): boolean => {
       if (isTauriApp) {
-        if (!rustWsConnectedRef.current) return false;
+        if (!rustWsConnectedMapRef.current.get(hostKey)) return false;
         const b64 = bytesToBase64(new Uint8Array(packet));
-        void rustWsSendBinary(b64).catch(() => {});
+        void rustWsSendBinary(hostKey, b64).catch(() => {});
         return true;
       }
-      const ws = wsRef.current;
+      const ws = wsMapRef.current.get(hostKey);
       if (ws && ws.readyState === WebSocket.OPEN && ws.bufferedAmount < 512 * 1024) {
         ws.send(packet);
         return true;
@@ -573,18 +757,18 @@ export function useLocalChat() {
     [isTauriApp]
   );
 
-  const sendBinaryReliable = useCallback(
-    async (packet: ArrayBuffer): Promise<boolean> => {
+  const sendBinaryReliableToHost = useCallback(
+    async (hostKey: string, packet: ArrayBuffer): Promise<boolean> => {
       if (isTauriApp) {
-        if (!rustWsConnectedRef.current) return false;
+        if (!rustWsConnectedMapRef.current.get(hostKey)) return false;
         try {
           const b64 = bytesToBase64(new Uint8Array(packet));
-          return await rustWsSendBinary(b64);
+          return await rustWsSendBinary(hostKey, b64);
         } catch {
           return false;
         }
       }
-      const ws = wsRef.current;
+      const ws = wsMapRef.current.get(hostKey);
       if (!ws || ws.readyState !== WebSocket.OPEN) return false;
       while (ws.bufferedAmount > 2 * 1024 * 1024 && ws.readyState === WebSocket.OPEN) {
         await new Promise((r) => setTimeout(r, 25));
@@ -657,8 +841,37 @@ export function useLocalChat() {
   const ensureCallEngine = useCallback(() => {
     if (callEngineRef.current) return callEngineRef.current;
     const engine = new CallMediaEngine({
-      sendJson: sendJsonRaw,
-      sendBinary: sendBinaryRaw,
+      sendJson: (payload: unknown) => {
+        const obj = (payload || {}) as Record<string, unknown>;
+        const targetPeerId = String(
+          obj.targetPeerId || callSessionRef.current?.peerId || ''
+        ).trim();
+        const hostKey = targetPeerId
+          ? resolvePeerHostKey(targetPeerId)
+          : getFallbackConnectedHostKey();
+        return sendJsonRawToHost(hostKey, payload);
+      },
+      sendBinary: (packet: ArrayBuffer) => {
+        let targetPeerId = callSessionRef.current?.peerId || '';
+        if (!targetPeerId && packet.byteLength >= 8) {
+          try {
+            const view = new DataView(packet);
+            const hLen = view.getUint32(0, false);
+            if (hLen > 0 && hLen <= 16384 && packet.byteLength >= 4 + hLen) {
+              const header = JSON.parse(
+                new TextDecoder().decode(new Uint8Array(packet, 4, hLen))
+              ) as { targetId?: string };
+              if (header.targetId) targetPeerId = header.targetId;
+            }
+          } catch {
+            // ignore
+          }
+        }
+        const hostKey = targetPeerId
+          ? resolvePeerHostKey(targetPeerId)
+          : getFallbackConnectedHostKey();
+        return sendBinaryRawToHost(hostKey, packet);
+      },
       getDmAesKey: (peerId) => getConversationKey('dm', peerId),
       onTransportModeChange: (mode: CallTransportMode) => {
         setCallSession((prev) => (prev ? { ...prev, transportMode: mode } : prev));
@@ -679,7 +892,13 @@ export function useLocalChat() {
     engine.setRemoteCanvas(callRemoteCanvasRef.current);
     callEngineRef.current = engine;
     return engine;
-  }, [getConversationKey, sendBinaryRaw, sendJsonRaw]);
+  }, [
+    getConversationKey,
+    getFallbackConnectedHostKey,
+    resolvePeerHostKey,
+    sendBinaryRawToHost,
+    sendJsonRawToHost,
+  ]);
 
   const formatDurationLabel = useCallback((ms: number) => {
     const totalSec = Math.max(1, Math.round(ms / 1000));
@@ -746,15 +965,13 @@ export function useLocalChat() {
 
   const flushQueuedMessages = useCallback(async () => {
     if (!identityRef.current) return;
-    if (!isSocketOpen()) return;
+    if (!isAnySocketOpen()) return;
     if (outgoingQueueRef.current.length === 0) return;
 
     const transport = isTauriApp ? 'rust-ws' : 'browser-ws';
-    const activeHost = hostUrlRef.current || LOCAL_RUST_HOST_URL;
     tracerRef.current?.info(TraceTarget.SyncQueue, 'queue_flush_begin', {
       queued_count: outgoingQueueRef.current.length,
       transport,
-      host_url: activeHost,
       peers_online: peersRef.current.length,
     });
 
@@ -763,6 +980,19 @@ export function useLocalChat() {
 
     for (const item of outgoingQueueRef.current) {
       const convId = makeConversationId(item.conversationType, item.targetId);
+      const routeInfo =
+        item.conversationType === 'room'
+          ? parseScopedRoomTargetId(item.targetId)
+          : {
+              hostKey: item.hostKey || resolvePeerHostKey(item.targetId),
+              wireRoomId: item.targetId,
+            };
+
+      if (!isHostSocketOpen(routeInfo.hostKey)) {
+        remaining.push(item);
+        continue;
+      }
+
       try {
         const keyRes = await resolveConversationKeyResult(
           item.conversationType,
@@ -776,11 +1006,11 @@ export function useLocalChat() {
         const encStarted = performance.now();
         const encryptedPayload = await encryptTextAsync(keyRes.value, item.text);
         const encElapsed = Math.round(performance.now() - encStarted);
-        const sent = await sendJsonReliable({
+        const sent = await sendJsonReliableToHost(routeInfo.hostKey, {
           type: 'chat:message',
           id: item.id,
           conversationType: item.conversationType,
-          targetId: item.targetId,
+          targetId: routeInfo.wireRoomId,
           senderName: identityRef.current.displayName,
           timestamp: item.timestamp,
           encryptedPayload,
@@ -794,8 +1024,7 @@ export function useLocalChat() {
             PacketErrorCode.SendRejected,
             {
               transport,
-              socket_open: isSocketOpen(),
-              host_url: activeHost,
+              host_key: routeInfo.hostKey,
               enc_ms: encElapsed,
             },
             { msgId: item.id, convId }
@@ -803,12 +1032,13 @@ export function useLocalChat() {
           remaining.push(item);
         } else {
           sentCount += 1;
+          void removeOutgoingQueueItem(item.id).catch(() => {});
           tracerRef.current?.info(
             TraceTarget.SyncQueue,
             'queued_packet_dispatched',
             {
               transport,
-              host_url: activeHost,
+              host_key: routeInfo.hostKey,
               enc_ms: encElapsed,
             },
             { msgId: item.id, convId }
@@ -834,10 +1064,17 @@ export function useLocalChat() {
       sent_count: sentCount,
       remaining_count: remaining.length,
     });
-  }, [isSocketOpen, isTauriApp, resolveConversationKeyResult, sendJsonReliable]);
+  }, [
+    isAnySocketOpen,
+    isHostSocketOpen,
+    isTauriApp,
+    resolveConversationKeyResult,
+    resolvePeerHostKey,
+    sendJsonReliableToHost,
+  ]);
 
   const handleIncomingBinaryChunk = useCallback(
-    async (arrayBuffer: ArrayBuffer) => {
+    async (hostKey: string, arrayBuffer: ArrayBuffer) => {
       if (arrayBuffer.byteLength < 8) return;
       const view = new DataView(arrayBuffer);
       const headerLen = view.getUint32(0, false);
@@ -878,7 +1115,9 @@ export function useLocalChat() {
       if (!transfer) return;
 
       const keyTargetId =
-        header.conversationType === 'dm' ? header.senderId : header.targetId;
+        header.conversationType === 'dm'
+          ? header.senderId
+          : makeScopedRoomTargetId(hostKey, header.targetId);
       const aesKey = await getConversationKey(header.conversationType, keyTargetId);
       if (!aesKey) return;
 
@@ -962,16 +1201,117 @@ export function useLocalChat() {
     [getConversationKey, updateFileMessage]
   );
 
+  // Bootstrap persistent state
+  useEffect(() => {
+    unmountedRef.current = false;
+
+    async function bootstrap() {
+      const [storedId, storedMessages, storedRoomKeys, storedRooms, vPeers, vRooms, storedQueue] =
+        await Promise.all([
+          loadDeviceIdentity(),
+          loadAllMessages(),
+          loadAllRoomKeyRecords(),
+          loadCachedRooms(),
+          loadVerifiedPeers(),
+          loadVerifiedRooms(),
+          loadOutgoingQueue(),
+        ]);
+
+      if (unmountedRef.current) return;
+
+      outgoingQueueRef.current = storedQueue;
+      if (storedQueue.length > 0) {
+        setTelemetry((prev) => ({ ...prev, queuedCount: storedQueue.length }));
+      }
+
+      for (const rk of storedRoomKeys) {
+        try {
+          const { keyBytes, safetyCode } = await importRoomKeyFromBase64Async(rk.rawBase64);
+          roomKeysRef.current.set(rk.roomId, {
+            aesKey: keyBytes,
+            rawBase64: rk.rawBase64,
+            safetyCode,
+          });
+        } catch {
+          // ignore corrupted key
+        }
+      }
+
+      const codeMap: Record<string, string> = {};
+      for (const [rid, entry] of roomKeysRef.current.entries()) {
+        codeMap[rid] = entry.safetyCode;
+      }
+      setRoomSafetyCodes(codeMap);
+
+      if (storedRooms.length > 0) {
+        setRooms((prev) => {
+          const map = new Map(prev.map((r) => [r.roomId, r]));
+          for (const r of storedRooms) map.set(r.roomId, r);
+          return Array.from(map.values());
+        });
+      }
+
+      const vPeerMap: Record<string, VerifiedPeerRecord> = {};
+      for (const vp of vPeers) vPeerMap[vp.peerId] = vp;
+      setVerifiedPeers(vPeerMap);
+
+      const vRoomMap: Record<string, VerifiedRoomRecord> = {};
+      for (const vr of vRooms) vRoomMap[vr.roomId] = vr;
+      setVerifiedRooms(vRoomMap);
+
+      const urls: Record<string, string> = {};
+      for (const msg of storedMessages) {
+        if (msg.kind === 'file' && msg.file?.blobStored) {
+          const blobRec = await getFileBlob(msg.file.transferId);
+          if (blobRec?.blob) {
+            urls[msg.file.transferId] = URL.createObjectURL(blobRec.blob);
+          }
+        }
+        if (
+          msg.kind === 'file' &&
+          msg.file &&
+          (msg.file.status === 'sending' || msg.file.status === 'receiving')
+        ) {
+          msg.file.status = 'failed';
+          msg.file.errorMessage = 'Terputus sebelum transfer selesai';
+        }
+      }
+
+      fileUrlsRef.current = urls;
+      setFileUrls(urls);
+      setMessages(storedMessages);
+
+      if (storedId && storedId.privateKeyHex && storedId.publicKeyHex) {
+        identityRef.current = storedId;
+        setIdentity(storedId);
+        setNeedsOnboarding(false);
+      } else {
+        setNeedsOnboarding(true);
+      }
+
+      setIdentityReady(true);
+      void refreshLanInfo();
+      void refreshHostManagement();
+    }
+
+    void bootstrap();
+
+    return () => {
+      unmountedRef.current = true;
+    };
+  }, [refreshHostManagement, refreshLanInfo]);
+
+  // Multi-Host WebSocket orchestrator
   useEffect(() => {
     if (!identityReady || !identity) return;
 
     let cancelled = false;
     let unlistenRustWs: (() => void) | null = null;
 
-    const retryDecryptRoomMessages = async (roomId: string, aesKey: Uint8Array) => {
+    const retryDecryptRoomMessages = async (scopedRoomId: string, aesKey: Uint8Array) => {
       const entries = Array.from(undecryptedPayloadsRef.current.entries());
       for (const [msgId, info] of entries) {
-        if (info.conversationType !== 'room' || info.convTargetId !== roomId) continue;
+        if (info.conversationType !== 'room' || info.convTargetId !== scopedRoomId) continue;
         try {
           const text = await decryptTextAsync(aesKey, info.encryptedPayload);
           undecryptedPayloadsRef.current.delete(msgId);
@@ -998,87 +1338,104 @@ export function useLocalChat() {
       ? TraceTarget.TransportRustWs
       : TraceTarget.TransportBrowserWs;
 
-    const handleSocketOpen = (wsUrl: string) => {
+    const handleSocketOpen = (hostKey: string, wsUrl: string) => {
       if (cancelled) return;
-      reconnectAttemptRef.current = 0;
+      reconnectAttemptsRef.current.set(hostKey, 0);
+      authRejectedHostsRef.current.delete(hostKey);
+
+      const hostCfg = savedHostsRef.current.find((h) => h.key === hostKey);
 
       tracerRef.current?.info(transportTarget, 'socket_open_sending_hello', {
+        host_key: hostKey,
         ws_url: wsUrl,
         peer_id: identity.peerId,
         queued_count: outgoingQueueRef.current.length,
       });
 
-      void sendJsonReliable({
+      void sendJsonReliableToHost(hostKey, {
         type: 'hello',
         peerId: identity.peerId,
         displayName: identity.displayName,
         deviceLabel: detectDeviceLabel(),
         publicKeyHex: identity.publicKeyHex,
+        accessCode: hostCfg?.accessCode || undefined,
       });
 
-      setTelemetry((prev) => ({
+      updateHostRuntime(hostKey, (prev) => ({
         ...prev,
-        quality: 'connected',
-        wsEndpoint: wsUrl,
+        status: 'connected',
+        errorMessage: undefined,
       }));
-
-      if (pingIntervalRef.current) window.clearInterval(pingIntervalRef.current);
-      const sendPing = () => {
-        if (!isSocketOpen()) return;
-        const now = performance.now();
-        if (lastPingSentAtRef.current !== null && now - lastPingSentAtRef.current > 6000) {
-          setTelemetry((prev) => ({ ...prev, quality: 'degraded' }));
-        }
-        lastPingSentAtRef.current = now;
-        void sendJsonReliable({ type: 'ping', clientTs: now });
-      };
-      sendPing();
-      pingIntervalRef.current = window.setInterval(sendPing, 2500);
-
-      if (queueSweepTimerRef.current) window.clearInterval(queueSweepTimerRef.current);
-      queueSweepTimerRef.current = window.setInterval(() => {
-        if (!cancelled && outgoingQueueRef.current.length > 0 && isSocketOpen()) {
-          void flushQueuedMessages();
-        }
-      }, 2000);
     };
 
-    const handleSocketClose = (reason = 'closed') => {
-      if (pingIntervalRef.current) {
-        window.clearInterval(pingIntervalRef.current);
-        pingIntervalRef.current = null;
+    const handleSocketClose = (hostKey: string, reason = 'closed') => {
+      if (isTauriApp) {
+        rustWsConnectedMapRef.current.set(hostKey, false);
+      } else {
+        wsMapRef.current.delete(hostKey);
       }
-      if (queueSweepTimerRef.current) {
-        window.clearInterval(queueSweepTimerRef.current);
-        queueSweepTimerRef.current = null;
-      }
-      rustWsConnectedRef.current = false;
-      wsRef.current = null;
+
       if (cancelled || unmountedRef.current) return;
 
-      reconnectAttemptRef.current += 1;
-      const delay = Math.min(8000, 1000 * Math.pow(2, reconnectAttemptRef.current - 1));
+      // Remove peers from this host while disconnected
+      peersByHostRef.current.delete(hostKey);
+      recomputeUnifiedTopology();
+
+      const hostCfg = savedHostsRef.current.find((h) => h.key === hostKey);
+      if (!hostCfg || !hostCfg.enabled) {
+        updateHostRuntime(hostKey, (prev) => ({
+          ...prev,
+          status: 'disabled',
+          latencyMs: null,
+          peersOnline: 0,
+        }));
+        return;
+      }
+
+      if (authRejectedHostsRef.current.has(hostKey)) {
+        updateHostRuntime(hostKey, (prev) => ({
+          ...prev,
+          status: 'auth_error',
+          latencyMs: null,
+        }));
+        return;
+      }
+
+      const prevTimer = reconnectTimersRef.current.get(hostKey);
+      if (prevTimer) window.clearTimeout(prevTimer);
+
+      const attempt = (reconnectAttemptsRef.current.get(hostKey) || 0) + 1;
+      reconnectAttemptsRef.current.set(hostKey, attempt);
+      const delay = Math.min(8000, 1000 * Math.pow(2, attempt - 1));
+
       tracerRef.current?.warn(
         transportTarget,
         'socket_disconnected_scheduling_reconnect',
         PacketErrorCode.SocketClosed,
         {
-          attempt: reconnectAttemptRef.current,
+          host_key: hostKey,
+          attempt,
           delay_ms: delay,
-          host_url: hostUrl || LOCAL_RUST_HOST_URL,
           reason,
-          queued_count: outgoingQueueRef.current.length,
         }
       );
-      setTelemetry((prev) => ({
+
+      updateHostRuntime(hostKey, (prev) => ({
         ...prev,
-        quality: 'reconnecting',
+        status: 'reconnecting',
         latencyMs: null,
       }));
-      reconnectTimerRef.current = window.setTimeout(connect, delay);
+
+      const timer = window.setTimeout(() => {
+        const latestCfg = savedHostsRef.current.find((h) => h.key === hostKey);
+        if (!cancelled && latestCfg && latestCfg.enabled && !authRejectedHostsRef.current.has(hostKey)) {
+          connectHost(latestCfg);
+        }
+      }, delay);
+      reconnectTimersRef.current.set(hostKey, timer);
     };
 
-    const handleIncomingJsonText = async (rawText: string) => {
+    const handleIncomingJsonText = async (hostKey: string, rawText: string) => {
       let msg: Record<string, unknown>;
       try {
         msg = JSON.parse(rawText);
@@ -1088,63 +1445,125 @@ export function useLocalChat() {
 
       const type = msg.type as string;
 
+      if (type === 'auth:rejected') {
+        const reason = String(msg.reason || 'Kode akses host diperlukan atau tidak cocok');
+        authRejectedHostsRef.current.add(hostKey);
+        updateHostRuntime(hostKey, (prev) => ({
+          ...prev,
+          status: 'auth_error',
+          hostId: msg.hostId ? String(msg.hostId) : prev.hostId,
+          hostLabel: msg.hostLabel ? String(msg.hostLabel) : prev.hostLabel,
+          errorMessage: reason,
+          latencyMs: null,
+        }));
+        tracerRef.current?.warn(
+          transportTarget,
+          'host_auth_rejected',
+          PacketErrorCode.SendRejected,
+          { host_key: hostKey, reason }
+        );
+        return;
+      }
+
       if (type === 'pong') {
         const clientTs = Number(msg.clientTs);
         const rtt = Math.max(1, Math.round(performance.now() - clientTs));
-        lastPingSentAtRef.current = null;
-        setTelemetry((prev) => {
-          const nextSamples = [...prev.samples, { t: Date.now(), ms: rtt }].slice(-24);
-          const avg = Math.round(
-            nextSamples.reduce((acc, s) => acc + s.ms, 0) / nextSamples.length
-          );
-          let jitter = 0;
-          if (nextSamples.length > 1) {
-            let diffs = 0;
-            for (let i = 1; i < nextSamples.length; i++) {
-              diffs += Math.abs(nextSamples[i].ms - nextSamples[i - 1].ms);
+        lastPingSentByHostRef.current.delete(hostKey);
+
+        updateHostRuntime(hostKey, (prev) => ({
+          ...prev,
+          status: rtt >= 150 ? 'degraded' : 'connected',
+          latencyMs: rtt,
+          errorMessage: undefined,
+        }));
+
+        // Update sparkline from primary / best host
+        const isPrimaryHost =
+          hostKey === LOCAL_HOST_KEY || !isHostSocketOpen(LOCAL_HOST_KEY);
+        if (isPrimaryHost) {
+          setTelemetry((prev) => {
+            const nextSamples = [...prev.samples, { t: Date.now(), ms: rtt }].slice(-24);
+            const avg = Math.round(
+              nextSamples.reduce((acc, s) => acc + s.ms, 0) / nextSamples.length
+            );
+            let jitter = 0;
+            if (nextSamples.length > 1) {
+              let diffs = 0;
+              for (let i = 1; i < nextSamples.length; i++) {
+                diffs += Math.abs(nextSamples[i].ms - nextSamples[i - 1].ms);
+              }
+              jitter = Math.round(diffs / (nextSamples.length - 1));
             }
-            jitter = Math.round(diffs / (nextSamples.length - 1));
-          }
-          const quality: ConnectionQuality = rtt >= 150 ? 'degraded' : 'connected';
-          return {
-            ...prev,
-            quality,
-            latencyMs: rtt,
-            avgLatencyMs: avg,
-            jitterMs: jitter,
-            samples: nextSamples,
-            lastPongAt: Date.now(),
-          };
-        });
+            return {
+              ...prev,
+              latencyMs: rtt,
+              avgLatencyMs: avg,
+              jitterMs: jitter,
+              samples: nextSamples,
+              lastPongAt: Date.now(),
+            };
+          });
+        }
         return;
       }
 
       if (type === 'init') {
         const incomingPeers = (msg.peers as PeerInfo[]) || [];
         const incomingRooms = (msg.rooms as RoomInfo[]) || [];
+        const serverHostId = msg.hostId ? String(msg.hostId) : undefined;
+        const serverHostLabel = msg.hostLabel ? String(msg.hostLabel) : undefined;
 
-        // Synchronously update refs before async key derivations or room:key_request
-        peersRef.current = incomingPeers;
-        roomsRef.current = incomingRooms;
-        setPeers(incomingPeers);
-        setRooms(incomingRooms);
-        await saveCachedRooms(incomingRooms);
-
-        tracerRef.current?.info(TraceTarget.SyncKey, 'host_init_synced', {
-          peers_online: incomingPeers.filter((p) => p.online).length,
-          rooms_count: incomingRooms.length,
-          host_url: hostUrl || LOCAL_RUST_HOST_URL,
+        hostMetaByKeyRef.current.set(hostKey, {
+          hostId: serverHostId,
+          hostLabel: serverHostLabel,
         });
 
-        // If activeTarget points to a custom room missing on the host, ensure it exists or switch cleanly
+        updateHostRuntime(hostKey, (prev) => ({
+          ...prev,
+          status: 'connected',
+          hostId: serverHostId || prev.hostId,
+          hostLabel: serverHostLabel || prev.hostLabel,
+          peersOnline: incomingPeers.filter((p) => p.peerId !== identity.peerId && p.online).length,
+          errorMessage: undefined,
+        }));
+
+        peersByHostRef.current.set(hostKey, incomingPeers);
+        roomsByHostRef.current.set(hostKey, incomingRooms);
+        recomputeUnifiedTopology();
+
+        tracerRef.current?.info(TraceTarget.SyncKey, 'host_init_synced', {
+          host_key: hostKey,
+          host_id: serverHostId || '-',
+          peers_online: incomingPeers.filter((p) => p.online).length,
+          rooms_count: incomingRooms.length,
+        });
+
+        // Rejoin custom rooms on this host
+        const joinedWireRoomIds = new Set<string>();
+        for (const r of incomingRooms) {
+          if (r.roomId !== DEFAULT_ROOM_ID && r.memberIds.includes(identity.peerId)) {
+            joinedWireRoomIds.add(r.roomId);
+            void sendJsonReliableToHost(hostKey, { type: 'room:join', roomId: r.roomId });
+          }
+        }
+
+        const activeRoute = parseScopedRoomTargetId(activeTargetRef.current.id);
         if (
           activeTargetRef.current.type === 'room' &&
-          activeTargetRef.current.id !== DEFAULT_ROOM_ID &&
-          !incomingRooms.some((r) => r.roomId === activeTargetRef.current.id)
+          activeRoute.hostKey === hostKey &&
+          activeRoute.wireRoomId !== DEFAULT_ROOM_ID &&
+          !incomingRooms.some((r) => r.roomId === activeRoute.wireRoomId)
         ) {
           setActiveTarget({ type: 'room', id: DEFAULT_ROOM_ID });
-        } else if (activeTargetRef.current.type === 'room') {
-          void sendJsonReliable({ type: 'room:join', roomId: activeTargetRef.current.id });
+        } else if (
+          activeTargetRef.current.type === 'room' &&
+          activeRoute.hostKey === hostKey &&
+          !joinedWireRoomIds.has(activeRoute.wireRoomId)
+        ) {
+          void sendJsonReliableToHost(hostKey, {
+            type: 'room:join',
+            roomId: activeRoute.wireRoomId,
+          });
         }
 
         for (const p of incomingPeers) {
@@ -1153,66 +1572,111 @@ export function useLocalChat() {
           }
         }
 
-        const currentHostKey = hostUrl || LOCAL_RUST_HOST_URL;
         for (const r of incomingRooms) {
+          const scopedRoomId = makeScopedRoomTargetId(hostKey, r.roomId);
           if (r.memberIds.includes(identity.peerId) || r.roomId === DEFAULT_ROOM_ID) {
-            const syncMarker = `${currentHostKey}::${r.roomId}`;
+            const syncMarker = `${hostKey}::${r.roomId}`;
             const otherOnlineMembers = r.memberIds.filter(
               (id) =>
                 id !== identity.peerId &&
                 incomingPeers.some((p) => p.peerId === id && p.online)
             );
-            const hasKey = roomKeysRef.current.has(r.roomId);
+            const hasKey = roomKeysRef.current.has(scopedRoomId);
             const alreadySyncedOnThisHost = syncedRoomForHostRef.current.has(syncMarker);
 
             if (otherOnlineMembers.length > 0 && (!hasKey || !alreadySyncedOnThisHost)) {
-              await sendJsonReliable({ type: 'room:key_request', roomId: r.roomId });
-              window.setTimeout(async () => {
-                if (!roomKeysRef.current.has(r.roomId)) {
-                  const allSorted = [identity.peerId, ...otherOnlineMembers].sort();
-                  if (allSorted[0] === identity.peerId) {
-                    const created = await ensureRoomKeyLocal(r.roomId);
-                    syncedRoomForHostRef.current.add(syncMarker);
-                    for (const mId of otherOnlineMembers) {
-                      const memberPeer = peersRef.current.find((p) => p.peerId === mId);
-                      if (!memberPeer) continue;
-                      const dmEntry = await ensureDmKey(memberPeer);
-                      if (!dmEntry) continue;
-                      const wrapped = await encryptTextAsync(dmEntry.aesKey, created.rawBase64);
-                      void sendJsonReliable({
-                        type: 'room:key_share',
-                        roomId: r.roomId,
-                        targetPeerId: mId,
-                        encryptedKeyPayload: wrapped,
-                      });
+              const sortedOthers = [...otherOnlineMembers].sort();
+              if (hasKey && identity.peerId < sortedOthers[0]) {
+                const authoritative = roomKeysRef.current.get(scopedRoomId)!;
+                syncedRoomForHostRef.current.add(syncMarker);
+                tracerRef.current?.info(TraceTarget.SyncKey, 'room_key_authority_push', {
+                  host_key: hostKey,
+                  room_id: r.roomId,
+                  peer_count: sortedOthers.length,
+                  safety_code: authoritative.safetyCode,
+                });
+                for (const mId of sortedOthers) {
+                  const memberPeer = incomingPeers.find((p) => p.peerId === mId);
+                  if (!memberPeer) continue;
+                  const dmEntry = await ensureDmKey(memberPeer);
+                  if (!dmEntry) continue;
+                  const wrapped = await encryptTextAsync(dmEntry.aesKey, authoritative.rawBase64);
+                  void sendJsonReliableToHost(hostKey, {
+                    type: 'room:key_share',
+                    roomId: r.roomId,
+                    targetPeerId: mId,
+                    encryptedKeyPayload: wrapped,
+                  });
+                }
+              } else {
+                await sendJsonReliableToHost(hostKey, {
+                  type: 'room:key_request',
+                  roomId: r.roomId,
+                });
+                window.setTimeout(async () => {
+                  if (!roomKeysRef.current.has(scopedRoomId)) {
+                    const currentHostPeers = peersByHostRef.current.get(hostKey) || [];
+                    const currentHostRoom = (roomsByHostRef.current.get(hostKey) || []).find(
+                      (rm) => rm.roomId === r.roomId
+                    );
+                    const stillOthers =
+                      currentHostRoom?.memberIds.filter(
+                        (id) =>
+                          id !== identity.peerId &&
+                          currentHostPeers.some((p) => p.peerId === id && p.online)
+                      ) || sortedOthers;
+                    const allSorted = [identity.peerId, ...stillOthers].sort();
+                    if (allSorted[0] === identity.peerId) {
+                      const created = await ensureRoomKeyLocal(scopedRoomId);
+                      syncedRoomForHostRef.current.add(syncMarker);
+                      for (const mId of stillOthers) {
+                        const memberPeer = currentHostPeers.find((p) => p.peerId === mId);
+                        if (!memberPeer) continue;
+                        const dmEntry = await ensureDmKey(memberPeer);
+                        if (!dmEntry) continue;
+                        const wrapped = await encryptTextAsync(dmEntry.aesKey, created.rawBase64);
+                        void sendJsonReliableToHost(hostKey, {
+                          type: 'room:key_share',
+                          roomId: r.roomId,
+                          targetPeerId: mId,
+                          encryptedKeyPayload: wrapped,
+                        });
+                      }
                     }
                   }
-                }
-              }, 800);
+                }, 1500);
+              }
             } else if (!hasKey) {
-              await ensureRoomKeyLocal(r.roomId);
+              await ensureRoomKeyLocal(scopedRoomId);
               syncedRoomForHostRef.current.add(syncMarker);
             }
           }
         }
 
+        if (hostKey === LOCAL_HOST_KEY) {
+          void refreshHostManagement();
+        }
         await flushQueuedMessages();
         return;
       }
 
       if (type === 'peer:joined' || type === 'peer:updated') {
         const peer = msg.peer as PeerInfo;
-        const currentPeers = peersRef.current;
-        const nextPeers = currentPeers.some((p) => p.peerId === peer.peerId)
-          ? currentPeers.map((p) => (p.peerId === peer.peerId ? peer : p))
-          : [...currentPeers, peer];
-        peersRef.current = nextPeers;
-        setPeers(nextPeers);
+        const currentList = peersByHostRef.current.get(hostKey) || [];
+        const nextList = currentList.some((p) => p.peerId === peer.peerId)
+          ? currentList.map((p) => (p.peerId === peer.peerId ? peer : p))
+          : [...currentList, peer];
+        peersByHostRef.current.set(hostKey, nextList);
+        updateHostRuntime(hostKey, (prev) => ({
+          ...prev,
+          peersOnline: nextList.filter((p) => p.peerId !== identity.peerId && p.online).length,
+        }));
+        recomputeUnifiedTopology();
 
         tracerRef.current?.debug(TraceTarget.SyncKey, 'peer_presence_updated', {
+          host_key: hostKey,
           peer_id: peer.peerId,
-          online: peer.online,
-          peers_total: nextPeers.length,
+          hops: peer.hops ?? 0,
         });
 
         if (peer.peerId !== identity.peerId) {
@@ -1224,43 +1688,52 @@ export function useLocalChat() {
 
       if (type === 'peer:left') {
         const leftId = String(msg.peerId);
-        const nextPeers = peersRef.current.filter((p) => p.peerId !== leftId);
-        peersRef.current = nextPeers;
-        setPeers(nextPeers);
+        const currentList = peersByHostRef.current.get(hostKey) || [];
+        const nextList = currentList.filter((p) => p.peerId !== leftId);
+        peersByHostRef.current.set(hostKey, nextList);
+        updateHostRuntime(hostKey, (prev) => ({
+          ...prev,
+          peersOnline: nextList.filter((p) => p.peerId !== identity.peerId && p.online).length,
+        }));
+        recomputeUnifiedTopology();
         tracerRef.current?.debug(TraceTarget.SyncKey, 'peer_left', {
+          host_key: hostKey,
           peer_id: leftId,
-          peers_total: nextPeers.length,
         });
         return;
       }
 
       if (type === 'room:created' || type === 'room:updated') {
         const room = msg.room as RoomInfo;
-        const currentRooms = roomsRef.current;
+        const currentRooms = roomsByHostRef.current.get(hostKey) || [];
         const nextRooms = currentRooms.some((r) => r.roomId === room.roomId)
           ? currentRooms.map((r) => (r.roomId === room.roomId ? room : r))
           : [...currentRooms, room];
-        roomsRef.current = nextRooms;
-        setRooms(nextRooms);
-        void saveCachedRooms(nextRooms);
+        roomsByHostRef.current.set(hostKey, nextRooms);
+        recomputeUnifiedTopology();
         return;
       }
 
       if (type === 'room:key_request') {
-        const roomId = String(msg.roomId);
+        const wireRoomId = String(msg.roomId);
+        const scopedRoomId = makeScopedRoomTargetId(hostKey, wireRoomId);
         const requesterPeerId = String(msg.requesterPeerId);
-        let roomKeyEntry = roomKeysRef.current.get(roomId);
-        if (!roomKeyEntry && roomId === DEFAULT_ROOM_ID) {
-          roomKeyEntry = await ensureRoomKeyLocal(roomId);
+        let roomKeyEntry = roomKeysRef.current.get(scopedRoomId);
+        if (!roomKeyEntry && wireRoomId === DEFAULT_ROOM_ID) {
+          roomKeyEntry = await ensureRoomKeyLocal(scopedRoomId);
         }
-        const requesterPeer = peersRef.current.find((p) => p.peerId === requesterPeerId);
+        const hostPeers = peersByHostRef.current.get(hostKey) || [];
+        const requesterPeer =
+          hostPeers.find((p) => p.peerId === requesterPeerId) ||
+          peersRef.current.find((p) => p.peerId === requesterPeerId);
         if (!roomKeyEntry || !requesterPeer) {
           tracerRef.current?.warn(
             TraceTarget.SyncKey,
             'room_key_request_ignored',
             PacketErrorCode.KeyMissing,
             {
-              room_id: roomId,
+              host_key: hostKey,
+              room_id: wireRoomId,
               requester: requesterPeerId,
               has_room_key: Boolean(roomKeyEntry),
               has_requester_peer: Boolean(requesterPeer),
@@ -1272,31 +1745,49 @@ export function useLocalChat() {
         const dmEntry = await ensureDmKey(requesterPeer);
         if (!dmEntry) return;
         const wrapped = await encryptTextAsync(dmEntry.aesKey, roomKeyEntry.rawBase64);
-        void sendJsonReliable({
+        void sendJsonReliableToHost(hostKey, {
           type: 'room:key_share',
-          roomId,
+          roomId: wireRoomId,
           targetPeerId: requesterPeerId,
           encryptedKeyPayload: wrapped,
         });
         tracerRef.current?.debug(TraceTarget.SyncKey, 'room_key_shared_to_peer', {
-          room_id: roomId,
+          host_key: hostKey,
+          room_id: wireRoomId,
           target_peer: requesterPeerId,
         });
         return;
       }
 
       if (type === 'room:key_share') {
-        const roomId = String(msg.roomId);
+        const wireRoomId = String(msg.roomId);
+        const scopedRoomId = makeScopedRoomTargetId(hostKey, wireRoomId);
         const fromPeerId = String(msg.fromPeerId);
         const encryptedKeyPayload = msg.encryptedKeyPayload as EncryptedPayload;
-        const fromPeer = peersRef.current.find((p) => p.peerId === fromPeerId);
+        const hostPeers = peersByHostRef.current.get(hostKey) || [];
+        const fromPeer =
+          hostPeers.find((p) => p.peerId === fromPeerId) ||
+          peersRef.current.find((p) => p.peerId === fromPeerId);
         if (!fromPeer) {
           tracerRef.current?.warn(
             TraceTarget.SyncKey,
             'room_key_share_unknown_sender',
             PacketErrorCode.KeyMissing,
-            { room_id: roomId, from_peer: fromPeerId }
+            { host_key: hostKey, room_id: wireRoomId, from_peer: fromPeerId }
           );
+          return;
+        }
+
+        const syncMarker = `${hostKey}::${wireRoomId}`;
+        const hasKey = roomKeysRef.current.has(scopedRoomId);
+        const alreadySynced = syncedRoomForHostRef.current.has(syncMarker);
+        const hasUndecryptedForRoom = Array.from(undecryptedPayloadsRef.current.values()).some(
+          (v) => v.conversationType === 'room' && v.convTargetId === scopedRoomId
+        );
+
+        const shouldAcceptShare =
+          !hasKey || (!alreadySynced && fromPeerId < identity.peerId) || hasUndecryptedForRoom;
+        if (!shouldAcceptShare) {
           return;
         }
 
@@ -1305,21 +1796,21 @@ export function useLocalChat() {
           if (!dmEntry) return;
           const rawBase64 = await decryptTextAsync(dmEntry.aesKey, encryptedKeyPayload);
           const { keyBytes, safetyCode } = await importRoomKeyFromBase64Async(rawBase64);
-          roomKeysRef.current.set(roomId, {
+          roomKeysRef.current.set(scopedRoomId, {
             aesKey: keyBytes,
             rawBase64,
             safetyCode,
           });
-          const currentHostKey = hostUrl || LOCAL_RUST_HOST_URL;
-          syncedRoomForHostRef.current.add(`${currentHostKey}::${roomId}`);
-          await saveRoomKeyRecord(roomId, rawBase64, safetyCode);
-          setRoomSafetyCodes((prev) => ({ ...prev, [roomId]: safetyCode }));
+          syncedRoomForHostRef.current.add(syncMarker);
+          await saveRoomKeyRecord(scopedRoomId, rawBase64, safetyCode);
+          setRoomSafetyCodes((prev) => ({ ...prev, [scopedRoomId]: safetyCode }));
           tracerRef.current?.info(TraceTarget.SyncKey, 'room_key_synchronized', {
-            room_id: roomId,
+            host_key: hostKey,
+            room_id: wireRoomId,
             from_peer: fromPeerId,
             safety_code: safetyCode,
           });
-          await retryDecryptRoomMessages(roomId, keyBytes);
+          await retryDecryptRoomMessages(scopedRoomId, keyBytes);
           await flushQueuedMessages();
         } catch (unwrapErr) {
           tracerRef.current?.warn(
@@ -1327,7 +1818,8 @@ export function useLocalChat() {
             'room_key_unwrap_failed',
             PacketErrorCode.DecryptMismatch,
             {
-              room_id: roomId,
+              host_key: hostKey,
+              room_id: wireRoomId,
               from_peer: fromPeerId,
               err_msg: unwrapErr instanceof Error ? unwrapErr.message : String(unwrapErr),
             }
@@ -1341,9 +1833,19 @@ export function useLocalChat() {
         const recipientCount =
           typeof msg.recipientCount === 'number' ? msg.recipientCount : undefined;
         tracerRef.current?.finishMessageSpan(ackId, recipientCount, {
-          host_url: hostUrl || LOCAL_RUST_HOST_URL,
+          host_key: hostKey,
           transport: isTauriApp ? 'rust-ws' : 'browser-ws',
         });
+
+        const prevLen = outgoingQueueRef.current.length;
+        if (prevLen > 0) {
+          const nextQueue = outgoingQueueRef.current.filter((q) => q.id !== ackId);
+          if (nextQueue.length !== prevLen) {
+            outgoingQueueRef.current = nextQueue;
+            setTelemetry((prev) => ({ ...prev, queuedCount: nextQueue.length }));
+            void removeOutgoingQueueItem(ackId).catch(() => {});
+          }
+        }
 
         let ackedMsg: ChatMessageRecord | null = null;
         setMessages((prev) =>
@@ -1364,8 +1866,11 @@ export function useLocalChat() {
       if (type === 'chat:message') {
         const conversationType = msg.conversationType as 'room' | 'dm';
         const senderId = String(msg.senderId);
-        const targetId = String(msg.targetId);
-        const convTargetId = conversationType === 'dm' ? senderId : targetId;
+        const wireTargetId = String(msg.targetId);
+        const convTargetId =
+          conversationType === 'dm'
+            ? senderId
+            : makeScopedRoomTargetId(hostKey, wireTargetId);
         const conversationId = makeConversationId(conversationType, convTargetId);
         const msgId = String(msg.id);
 
@@ -1378,7 +1883,12 @@ export function useLocalChat() {
             TraceTarget.SyncDecrypt,
             'incoming_key_missing',
             PacketErrorCode.KeyMissing,
-            { conv_type: conversationType, from_peer: senderId, target_id: convTargetId },
+            {
+              host_key: hostKey,
+              conv_type: conversationType,
+              from_peer: senderId,
+              target_id: convTargetId,
+            },
             { msgId, convId: conversationId }
           );
         } else if (msg.encryptedPayload) {
@@ -1391,7 +1901,7 @@ export function useLocalChat() {
             tracerRef.current?.debug(
               TraceTarget.SyncDecrypt,
               'incoming_packet_decrypted',
-              { conv_type: conversationType, from_peer: senderId },
+              { host_key: hostKey, conv_type: conversationType, from_peer: senderId },
               msgId
             );
           } catch (decErr) {
@@ -1401,6 +1911,7 @@ export function useLocalChat() {
               'incoming_decrypt_mismatch',
               PacketErrorCode.DecryptMismatch,
               {
+                host_key: hostKey,
                 conv_type: conversationType,
                 from_peer: senderId,
                 target_id: convTargetId,
@@ -1413,8 +1924,13 @@ export function useLocalChat() {
                 conversationType,
                 convTargetId,
                 encryptedPayload: msg.encryptedPayload as EncryptedPayload,
+                hostKey,
+                wireTargetId,
               });
-              void sendJsonReliable({ type: 'room:key_request', roomId: convTargetId });
+              void sendJsonReliableToHost(hostKey, {
+                type: 'room:key_request',
+                roomId: wireTargetId,
+              });
             }
           }
         }
@@ -1440,8 +1956,11 @@ export function useLocalChat() {
       if (type === 'file:offer') {
         const conversationType = msg.conversationType as 'room' | 'dm';
         const senderId = String(msg.senderId);
-        const targetId = String(msg.targetId);
-        const convTargetId = conversationType === 'dm' ? senderId : targetId;
+        const wireTargetId = String(msg.targetId);
+        const convTargetId =
+          conversationType === 'dm'
+            ? senderId
+            : makeScopedRoomTargetId(hostKey, wireTargetId);
         const conversationId = makeConversationId(conversationType, convTargetId);
         const transferId = String(msg.transferId);
         const totalChunks = Number(msg.totalChunks || 1);
@@ -1512,12 +2031,14 @@ export function useLocalChat() {
         const callId = String(msg.callId || '');
         const callerId = String(msg.callerId || '');
         const callType: CallType = msg.callType === 'video' ? 'video' : 'audio';
-        const callerPeer = peersRef.current.find((p) => p.peerId === callerId);
+        const callerPeer =
+          (peersByHostRef.current.get(hostKey) || []).find((p) => p.peerId === callerId) ||
+          peersRef.current.find((p) => p.peerId === callerId);
         const callerName = String(msg.callerName || callerPeer?.displayName || 'Perangkat Lokal');
         if (!callId || !callerId) return;
 
         if (callSessionRef.current && callSessionRef.current.status !== 'ended') {
-          void sendJsonReliable({
+          void sendJsonReliableToHost(hostKey, {
             type: 'call:reject',
             callId,
             targetPeerId: callerId,
@@ -1646,29 +2167,32 @@ export function useLocalChat() {
       }
     };
 
-    const connect = () => {
-      if (cancelled || unmountedRef.current) return;
+    const connectHost = (hostCfg: HostConnectionConfig) => {
+      if (cancelled || unmountedRef.current || !hostCfg.enabled) return;
 
-      const wsUrl = buildWsEndpoint(hostUrl);
+      const wsUrl = buildWsEndpoint(
+        hostCfg.isLocal && !isTauriApp ? '' : hostCfg.url
+      );
 
       tracerRef.current?.info(transportTarget, 'socket_connecting', {
+        host_key: hostCfg.key,
         ws_url: wsUrl,
-        host_url: hostUrl || LOCAL_RUST_HOST_URL,
-        attempt: reconnectAttemptRef.current + 1,
+        attempt: (reconnectAttemptsRef.current.get(hostCfg.key) || 0) + 1,
       });
 
-      setTelemetry((prev) => ({
+      updateHostRuntime(hostCfg.key, (prev) => ({
         ...prev,
-        quality: reconnectAttemptRef.current > 0 ? 'reconnecting' : prev.quality,
-        wsEndpoint: wsUrl,
+        status: prev.status === 'connected' ? prev.status : 'reconnecting',
       }));
 
       if (isTauriApp) {
-        rustWsConnectedRef.current = false;
-        void rustWsConnect(wsUrl)
+        rustWsConnectedMapRef.current.set(hostCfg.key, false);
+        const nextConnId = ++rustClientConnSeqRef.current;
+        rustActiveConnIdMapRef.current.set(hostCfg.key, nextConnId);
+        void rustWsConnect(hostCfg.key, wsUrl, nextConnId)
           .then((connId) => {
             if (!cancelled) {
-              rustActiveConnIdRef.current = connId;
+              rustActiveConnIdMapRef.current.set(hostCfg.key, connId);
             }
           })
           .catch((connErr) => {
@@ -1677,33 +2201,45 @@ export function useLocalChat() {
               'rust_ws_connect_invoke_failed',
               PacketErrorCode.RustIpcError,
               {
+                host_key: hostCfg.key,
                 ws_url: wsUrl,
                 err_msg: connErr instanceof Error ? connErr.message : String(connErr),
               }
             );
-            handleSocketClose('rust_ws_connect_invoke_failed');
+            handleSocketClose(hostCfg.key, 'rust_ws_connect_invoke_failed');
           });
         return;
       }
 
+      const prevWs = wsMapRef.current.get(hostCfg.key);
+      if (prevWs) {
+        try {
+          prevWs.close();
+        } catch {
+          // ignore
+        }
+      }
+
       const ws = new WebSocket(wsUrl);
       ws.binaryType = 'arraybuffer';
-      wsRef.current = ws;
+      wsMapRef.current.set(hostCfg.key, ws);
 
       ws.onopen = () => {
-        handleSocketOpen(wsUrl);
+        if (wsMapRef.current.get(hostCfg.key) !== ws) return;
+        handleSocketOpen(hostCfg.key, wsUrl);
       };
 
       ws.onmessage = async (event) => {
         if (event.data instanceof ArrayBuffer) {
-          await handleIncomingBinaryChunk(event.data);
+          await handleIncomingBinaryChunk(hostCfg.key, event.data);
           return;
         }
-        await handleIncomingJsonText(String(event.data));
+        await handleIncomingJsonText(hostCfg.key, String(event.data));
       };
 
       ws.onclose = (ev) => {
-        handleSocketClose(`code=${ev.code}`);
+        if (wsMapRef.current.get(hostCfg.key) !== ws) return;
+        handleSocketClose(hostCfg.key, `code=${ev.code}`);
       };
 
       ws.onerror = () => {
@@ -1711,66 +2247,134 @@ export function useLocalChat() {
           TraceTarget.TransportBrowserWs,
           'browser_ws_transport_error',
           PacketErrorCode.SocketClosed,
-          { ws_url: wsUrl }
+          { host_key: hostCfg.key, ws_url: wsUrl }
         );
-        setTelemetry((prev) => ({
-          ...prev,
-          quality: 'disconnected',
-        }));
       };
+    };
+
+    connectHostFnRef.current = connectHost;
+
+    const disconnectHostSocket = (hostKey: string) => {
+      const timer = reconnectTimersRef.current.get(hostKey);
+      if (timer) {
+        window.clearTimeout(timer);
+        reconnectTimersRef.current.delete(hostKey);
+      }
+      peersByHostRef.current.delete(hostKey);
+      roomsByHostRef.current.delete(hostKey);
+      if (isTauriApp) {
+        rustWsConnectedMapRef.current.set(hostKey, false);
+        void rustWsDisconnect(hostKey).catch(() => {});
+      } else {
+        const ws = wsMapRef.current.get(hostKey);
+        if (ws) {
+          wsMapRef.current.delete(hostKey);
+          try {
+            ws.close();
+          } catch {
+            // ignore
+          }
+        }
+      }
     };
 
     const boot = async () => {
       if (isTauriApp) {
         unlistenRustWs = await subscribeRustWsEvents({
           onOpen: (payload) => {
-            if (cancelled || payload.connId !== rustActiveConnIdRef.current) return;
-            rustWsConnectedRef.current = true;
-            handleSocketOpen(payload.url);
+            if (cancelled) return;
+            const expected = rustActiveConnIdMapRef.current.get(payload.hostKey);
+            if (payload.connId !== expected) return;
+            rustWsConnectedMapRef.current.set(payload.hostKey, true);
+            handleSocketOpen(payload.hostKey, payload.url);
           },
           onText: (payload) => {
-            if (cancelled || payload.connId !== rustActiveConnIdRef.current) return;
-            void handleIncomingJsonText(payload.data);
+            if (cancelled) return;
+            const expected = rustActiveConnIdMapRef.current.get(payload.hostKey);
+            if (payload.connId !== expected) return;
+            void handleIncomingJsonText(payload.hostKey, payload.data);
           },
           onBinary: (payload) => {
-            if (cancelled || payload.connId !== rustActiveConnIdRef.current) return;
+            if (cancelled) return;
+            const expected = rustActiveConnIdMapRef.current.get(payload.hostKey);
+            if (payload.connId !== expected) return;
             const bytes = base64ToBytes(payload.dataBase64);
             const buf = bytes.buffer.slice(
               bytes.byteOffset,
               bytes.byteOffset + bytes.byteLength
             ) as ArrayBuffer;
-            void handleIncomingBinaryChunk(buf);
+            void handleIncomingBinaryChunk(payload.hostKey, buf);
           },
           onClose: (payload) => {
-            if (cancelled || payload.connId !== rustActiveConnIdRef.current) return;
-            handleSocketClose(payload.reason);
+            if (cancelled) return;
+            const expected = rustActiveConnIdMapRef.current.get(payload.hostKey);
+            if (payload.connId !== expected) return;
+            handleSocketClose(payload.hostKey, payload.reason);
           },
         });
       }
-      connect();
+
+      for (const hostCfg of savedHostsRef.current) {
+        if (hostCfg.enabled) {
+          connectHost(hostCfg);
+        }
+      }
+
+      if (pingIntervalRef.current) window.clearInterval(pingIntervalRef.current);
+      pingIntervalRef.current = window.setInterval(() => {
+        if (cancelled) return;
+        const now = performance.now();
+        for (const h of savedHostsRef.current) {
+          if (!h.enabled || !isHostSocketOpen(h.key)) continue;
+          const lastSent = lastPingSentByHostRef.current.get(h.key);
+          if (lastSent !== undefined && now - lastSent > 6000) {
+            updateHostRuntime(h.key, (prev) => ({ ...prev, status: 'degraded' }));
+          }
+          lastPingSentByHostRef.current.set(h.key, now);
+          void sendJsonReliableToHost(h.key, { type: 'ping', clientTs: now });
+        }
+      }, 2500);
+
+      if (queueSweepTimerRef.current) window.clearInterval(queueSweepTimerRef.current);
+      queueSweepTimerRef.current = window.setInterval(() => {
+        if (!cancelled && outgoingQueueRef.current.length > 0 && isAnySocketOpen()) {
+          void flushQueuedMessages();
+        }
+      }, 2000);
     };
 
     void boot();
 
     return () => {
       cancelled = true;
-      if (pingIntervalRef.current) window.clearInterval(pingIntervalRef.current);
-      if (queueSweepTimerRef.current) window.clearInterval(queueSweepTimerRef.current);
-      if (reconnectTimerRef.current) window.clearTimeout(reconnectTimerRef.current);
-      if (unlistenRustWs) unlistenRustWs();
-      if (isTauriApp) {
-        rustWsConnectedRef.current = false;
-        void rustWsDisconnect().catch(() => {});
+      connectHostFnRef.current = null;
+      if (pingIntervalRef.current) {
+        window.clearInterval(pingIntervalRef.current);
+        pingIntervalRef.current = null;
       }
-      if (wsRef.current) {
-        wsRef.current.close();
-        wsRef.current = null;
+      if (queueSweepTimerRef.current) {
+        window.clearInterval(queueSweepTimerRef.current);
+        queueSweepTimerRef.current = null;
+      }
+      if (unlistenRustWs) unlistenRustWs();
+      for (const timer of reconnectTimersRef.current.values()) {
+        window.clearTimeout(timer);
+      }
+      reconnectTimersRef.current.clear();
+      const keys = Array.from(
+        new Set([
+          ...wsMapRef.current.keys(),
+          ...rustWsConnectedMapRef.current.keys(),
+          ...savedHostsRef.current.map((h) => h.key),
+        ])
+      );
+      for (const key of keys) {
+        disconnectHostSocket(key);
       }
     };
   }, [
     identityReady,
     identity,
-    hostUrl,
     isTauriApp,
     appendMessageIdempotent,
     ensureCallEngine,
@@ -1780,10 +2384,44 @@ export function useLocalChat() {
     flushQueuedMessages,
     getConversationKey,
     handleIncomingBinaryChunk,
-    isSocketOpen,
-    sendJsonReliable,
+    isAnySocketOpen,
+    isHostSocketOpen,
+    recomputeUnifiedTopology,
+    refreshHostManagement,
+    sendJsonReliableToHost,
     updateFileMessage,
+    updateHostRuntime,
   ]);
+
+  // Helper to disconnect a single host immediately when user removes or disables it
+  const closeSingleHost = useCallback(
+    (hostKey: string) => {
+      const timer = reconnectTimersRef.current.get(hostKey);
+      if (timer) {
+        window.clearTimeout(timer);
+        reconnectTimersRef.current.delete(hostKey);
+      }
+      peersByHostRef.current.delete(hostKey);
+      roomsByHostRef.current.delete(hostKey);
+      lastPingSentByHostRef.current.delete(hostKey);
+      if (isTauriApp) {
+        rustWsConnectedMapRef.current.set(hostKey, false);
+        void rustWsDisconnect(hostKey).catch(() => {});
+      } else {
+        const ws = wsMapRef.current.get(hostKey);
+        if (ws) {
+          wsMapRef.current.delete(hostKey);
+          try {
+            ws.close();
+          } catch {
+            // ignore
+          }
+        }
+      }
+      recomputeUnifiedTopology();
+    },
+    [isTauriApp, recomputeUnifiedTopology]
+  );
 
   const probeHost = useCallback(
     async (targetUrl: string): Promise<RustHostProbeResultDto> => {
@@ -1801,6 +2439,10 @@ export function useLocalChat() {
             peersOnline?: number;
             activeCalls?: number;
             engine?: string;
+            hostId?: string;
+            hostLabel?: string;
+            requiresAccessCode?: boolean;
+            bridgeCount?: number;
           };
           result = {
             ok: Boolean(data.ok),
@@ -1808,6 +2450,10 @@ export function useLocalChat() {
             peersOnline: data.peersOnline ?? 0,
             activeCalls: data.activeCalls ?? 0,
             engine: data.engine || 'node-ws',
+            hostId: data.hostId ?? null,
+            hostLabel: data.hostLabel ?? null,
+            requiresAccessCode: Boolean(data.requiresAccessCode),
+            bridgeCount: data.bridgeCount ?? 0,
             error: data.ok ? null : 'Host tidak merespons sebagai server LokaKirim',
           };
         } catch (probeErr) {
@@ -1825,6 +2471,7 @@ export function useLocalChat() {
       if (result.ok) {
         tracerRef.current?.info(TraceTarget.HostProbe, 'host_probe_ok', {
           target_url: targetUrl,
+          host_id: result.hostId || '-',
           latency_ms: result.latencyMs,
           peers_online: result.peersOnline,
           engine: result.engine,
@@ -1847,33 +2494,254 @@ export function useLocalChat() {
     [isTauriApp]
   );
 
+  const addRemoteHost = useCallback(
+    (rawUrl: string, accessCode?: string, customLabel?: string) => {
+      const normalized = normalizeHostUrl(rawUrl);
+      if (!normalized) return null;
+      const key = makeRemoteHostKey(normalized);
+      const label = customLabel?.trim() || normalized.replace(/^https?:\/\//i, '');
+      const cleanCode = accessCode?.trim() || undefined;
+
+      authRejectedHostsRef.current.delete(key);
+      reconnectAttemptsRef.current.set(key, 0);
+
+      const current = savedHostsRef.current;
+      const exists = current.some((h) => h.key === key);
+      const nextCfg: HostConnectionConfig = {
+        key,
+        url: normalized,
+        label,
+        accessCode: cleanCode,
+        enabled: true,
+        isLocal: false,
+      };
+      const nextList = exists
+        ? current.map((h) => (h.key === key ? nextCfg : h))
+        : [...current, nextCfg];
+
+      savedHostsRef.current = nextList;
+      saveHostConfigs(nextList);
+      setSavedHosts(nextList);
+
+      setHostRuntimes((prev) => {
+        const existsRt = prev.some((r) => r.key === key);
+        const entry: HostConnectionRuntime = {
+          key,
+          url: normalized,
+          label,
+          status: 'reconnecting',
+          latencyMs: null,
+          peersOnline: 0,
+          enabled: true,
+          isLocal: false,
+        };
+        const updated = existsRt
+          ? prev.map((r) => (r.key === key ? { ...r, ...entry } : r))
+          : [...prev, entry];
+        hostRuntimesRef.current = updated;
+        return updated;
+      });
+
+      closeSingleHost(key);
+      connectHostFnRef.current?.(nextCfg);
+      return nextCfg;
+    },
+    [closeSingleHost]
+  );
+
+  const removeRemoteHost = useCallback(
+    (hostKey: string) => {
+      if (hostKey === LOCAL_HOST_KEY) return;
+      closeSingleHost(hostKey);
+      authRejectedHostsRef.current.delete(hostKey);
+      const nextList = savedHostsRef.current.filter((h) => h.key !== hostKey);
+      savedHostsRef.current = nextList;
+      saveHostConfigs(nextList);
+      setSavedHosts(nextList);
+
+      setHostRuntimes((prev) => {
+        const next = prev.filter((r) => r.key !== hostKey);
+        hostRuntimesRef.current = next;
+        return next;
+      });
+
+      const activeRoute = parseScopedRoomTargetId(activeTargetRef.current.id);
+      if (activeTargetRef.current.type === 'room' && activeRoute.hostKey === hostKey) {
+        setActiveTarget({ type: 'room', id: DEFAULT_ROOM_ID });
+      }
+    },
+    [closeSingleHost]
+  );
+
+  const toggleHostEnabled = useCallback(
+    (hostKey: string) => {
+      const target = savedHostsRef.current.find((h) => h.key === hostKey);
+      if (!target) return;
+      const nextEnabled = !target.enabled;
+      const updatedCfg = { ...target, enabled: nextEnabled };
+      const nextList = savedHostsRef.current.map((h) => (h.key === hostKey ? updatedCfg : h));
+      savedHostsRef.current = nextList;
+      saveHostConfigs(nextList);
+      setSavedHosts(nextList);
+
+      if (nextEnabled) {
+        authRejectedHostsRef.current.delete(hostKey);
+        reconnectAttemptsRef.current.set(hostKey, 0);
+        updateHostRuntime(hostKey, (prev) => ({
+          ...prev,
+          enabled: true,
+          status: 'reconnecting',
+          errorMessage: undefined,
+        }));
+        connectHostFnRef.current?.(updatedCfg);
+      } else {
+        closeSingleHost(hostKey);
+        updateHostRuntime(hostKey, (prev) => ({
+          ...prev,
+          enabled: false,
+          status: 'disabled',
+          latencyMs: null,
+          peersOnline: 0,
+        }));
+      }
+    },
+    [closeSingleHost, updateHostRuntime]
+  );
+
+  const updateHostAccessCode = useCallback(
+    (hostKey: string, nextCode: string) => {
+      const target = savedHostsRef.current.find((h) => h.key === hostKey);
+      if (!target) return;
+      const cleanCode = nextCode.trim() || undefined;
+      const updatedCfg: HostConnectionConfig = {
+        ...target,
+        accessCode: cleanCode,
+        enabled: true,
+      };
+      const nextList = savedHostsRef.current.map((h) => (h.key === hostKey ? updatedCfg : h));
+      savedHostsRef.current = nextList;
+      saveHostConfigs(nextList);
+      setSavedHosts(nextList);
+
+      authRejectedHostsRef.current.delete(hostKey);
+      reconnectAttemptsRef.current.set(hostKey, 0);
+      closeSingleHost(hostKey);
+      updateHostRuntime(hostKey, (prev) => ({
+        ...prev,
+        enabled: true,
+        status: 'reconnecting',
+        errorMessage: undefined,
+      }));
+      connectHostFnRef.current?.(updatedCfg);
+    },
+    [closeSingleHost, updateHostRuntime]
+  );
+
+  const updateLocalHostConfig = useCallback(
+    async (hostLabelInput?: string, accessCodeInput?: string): Promise<HostConfigInfo | null> => {
+      let updated: HostConfigInfo | null = null;
+      if (isTauriApp) {
+        updated = await rustSetHostConfig(hostLabelInput, accessCodeInput);
+      } else {
+        const res = await fetch(buildApiUrl('', '/api/host-config'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            hostLabel: hostLabelInput,
+            accessCode: accessCodeInput,
+          }),
+        });
+        if (res.ok) {
+          updated = (await res.json()) as HostConfigInfo;
+        }
+      }
+      if (updated) {
+        setLocalHostConfig(updated);
+        // Keep local host client access code aligned so local client can always authenticate to itself
+        if (accessCodeInput !== undefined) {
+          const cleanCode = accessCodeInput.trim() || undefined;
+          const nextList = savedHostsRef.current.map((h) =>
+            h.key === LOCAL_HOST_KEY ? { ...h, accessCode: cleanCode } : h
+          );
+          savedHostsRef.current = nextList;
+          saveHostConfigs(nextList);
+          setSavedHosts(nextList);
+        }
+        updateHostRuntime(LOCAL_HOST_KEY, (prev) => ({
+          ...prev,
+          hostId: updated!.hostId,
+          hostLabel: updated!.hostLabel,
+        }));
+        void refreshLanInfo();
+      }
+      return updated;
+    },
+    [isTauriApp, refreshLanInfo, updateHostRuntime]
+  );
+
+  const addHostBridge = useCallback(
+    async (targetUrl: string, accessCodeInput?: string): Promise<HostBridgeInfo> => {
+      let created: HostBridgeInfo;
+      if (isTauriApp) {
+        created = await rustAddBridge(targetUrl, accessCodeInput);
+      } else {
+        const res = await fetch(buildApiUrl('', '/api/bridges'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            targetUrl,
+            accessCode: accessCodeInput || undefined,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.error || 'Gagal membuat Host Bridge');
+        }
+        created = data as HostBridgeInfo;
+      }
+      await refreshHostManagement();
+      return created;
+    },
+    [isTauriApp, refreshHostManagement]
+  );
+
+  const removeHostBridge = useCallback(
+    async (bridgeId: string): Promise<void> => {
+      if (isTauriApp) {
+        await rustRemoveBridge(bridgeId);
+      } else {
+        await fetch(buildApiUrl('', `/api/bridges/${encodeURIComponent(bridgeId)}`), {
+          method: 'DELETE',
+        });
+      }
+      await refreshHostManagement();
+    },
+    [isTauriApp, refreshHostManagement]
+  );
+
+  // Backwards-compatible convenience wrappers
   const switchHostUrl = useCallback(
     (nextUrl: string) => {
       const saved = saveHostUrl(nextUrl);
-      reconnectAttemptRef.current = 0;
-      syncedRoomForHostRef.current.clear();
-      peersRef.current = [];
-      setPeers([]);
       setHostUrl(saved);
       hostUrlRef.current = saved;
+      if (saved && saved !== LOCAL_RUST_HOST_URL) {
+        addRemoteHost(saved);
+      }
       window.setTimeout(() => {
-        refreshLanInfo();
+        void refreshLanInfo();
       }, 100);
       return saved;
     },
-    [refreshLanInfo]
+    [addRemoteHost, refreshLanInfo]
   );
 
   const resetHostToLocal = useCallback(() => {
     const saved = saveHostUrl('');
-    reconnectAttemptRef.current = 0;
-    syncedRoomForHostRef.current.clear();
-    peersRef.current = [];
-    setPeers([]);
     setHostUrl(saved);
     hostUrlRef.current = saved;
     window.setTimeout(() => {
-      refreshLanInfo();
+      void refreshLanInfo();
     }, 100);
     return saved;
   }, [refreshLanInfo]);
@@ -1902,38 +2770,48 @@ export function useLocalChat() {
       identityRef.current = updated;
       setIdentity(updated);
       await saveDeviceIdentity(updated);
-      sendJsonRaw({ type: 'peer:rename', displayName: trimmed });
+      for (const h of savedHostsRef.current) {
+        if (h.enabled && isHostSocketOpen(h.key)) {
+          sendJsonRawToHost(h.key, { type: 'peer:rename', displayName: trimmed });
+        }
+      }
     },
-    [sendJsonRaw]
+    [isHostSocketOpen, sendJsonRawToHost]
   );
 
   const createRoom = useCallback(
-    async (roomName: string) => {
+    async (roomName: string, targetHostKey?: string) => {
       const trimmed = roomName.trim().slice(0, 48);
       if (!trimmed || !identityRef.current) return null;
-      const roomId = `ruang-${randomUuid().slice(0, 8)}`;
-      await ensureRoomKeyLocal(roomId);
-      sendJsonRaw({
+      const hostKey =
+        targetHostKey && isHostSocketOpen(targetHostKey)
+          ? targetHostKey
+          : getFallbackConnectedHostKey();
+      const wireRoomId = `ruang-${randomUuid().slice(0, 8)}`;
+      const scopedRoomId = makeScopedRoomTargetId(hostKey, wireRoomId);
+      await ensureRoomKeyLocal(scopedRoomId);
+      sendJsonRawToHost(hostKey, {
         type: 'room:create',
-        roomId,
+        roomId: wireRoomId,
         name: trimmed,
       });
-      setActiveTarget({ type: 'room', id: roomId });
-      return roomId;
+      setActiveTarget({ type: 'room', id: scopedRoomId });
+      return scopedRoomId;
     },
-    [ensureRoomKeyLocal, sendJsonRaw]
+    [ensureRoomKeyLocal, getFallbackConnectedHostKey, isHostSocketOpen, sendJsonRawToHost]
   );
 
   const joinRoom = useCallback(
-    (roomId: string) => {
+    (scopedRoomId: string) => {
       if (!identityRef.current) return;
-      sendJsonRaw({ type: 'room:join', roomId });
-      if (!roomKeysRef.current.has(roomId)) {
-        sendJsonRaw({ type: 'room:key_request', roomId });
+      const { hostKey, wireRoomId } = parseScopedRoomTargetId(scopedRoomId);
+      sendJsonRawToHost(hostKey, { type: 'room:join', roomId: wireRoomId });
+      if (!roomKeysRef.current.has(scopedRoomId)) {
+        sendJsonRawToHost(hostKey, { type: 'room:key_request', roomId: wireRoomId });
       }
-      setActiveTarget({ type: 'room', id: roomId });
+      setActiveTarget({ type: 'room', id: scopedRoomId });
     },
-    [sendJsonRaw]
+    [sendJsonRawToHost]
   );
 
   const sendTextMessage = useCallback(
@@ -1948,24 +2826,30 @@ export function useLocalChat() {
       const transportTarget = isTauriApp
         ? TraceTarget.TransportRustWs
         : TraceTarget.TransportBrowserWs;
-      const activeHost = hostUrlRef.current || LOCAL_RUST_HOST_URL;
+
+      const routeInfo =
+        target.type === 'room'
+          ? parseScopedRoomTargetId(target.id)
+          : { hostKey: resolvePeerHostKey(target.id), wireRoomId: target.id };
+
+      const hostOpen = isHostSocketOpen(routeInfo.hostKey);
 
       tracerRef.current?.startMessageSpan(
         msgId,
         conversationId,
         {
-          host_url: activeHost,
+          host_key: routeInfo.hostKey,
           transport,
           target_type: target.type,
-          target_id: target.id,
+          target_id: routeInfo.wireRoomId,
           peers_online: peersRef.current.length,
-          socket_open: isSocketOpen(),
+          socket_open: hostOpen,
         },
         (elapsedMs) => ({
           elapsed_ms: elapsedMs,
-          socket_open: isSocketOpen(),
+          socket_open: isHostSocketOpen(routeInfo.hostKey),
           transport,
-          host_url: hostUrlRef.current || LOCAL_RUST_HOST_URL,
+          host_key: routeInfo.hostKey,
           queued_count: outgoingQueueRef.current.length,
           peers_online: peersRef.current.length,
         })
@@ -1988,13 +2872,16 @@ export function useLocalChat() {
 
       const queueForRetry = (reasonCode: PacketErrorCode) => {
         if (!outgoingQueueRef.current.some((q) => q.id === msgId)) {
-          outgoingQueueRef.current.push({
+          const queueItem: QueuedOutgoingMessage = {
             id: msgId,
             conversationType: target.type,
             targetId: target.id,
             text: trimmed,
             timestamp,
-          });
+            hostKey: routeInfo.hostKey,
+          };
+          outgoingQueueRef.current.push(queueItem);
+          void saveOutgoingQueueItem(queueItem).catch(() => {});
           setTelemetry((prev) => ({
             ...prev,
             queuedCount: outgoingQueueRef.current.length,
@@ -2006,7 +2893,7 @@ export function useLocalChat() {
             {
               queued_count: outgoingQueueRef.current.length,
               transport,
-              host_url: activeHost,
+              host_key: routeInfo.hostKey,
             },
             { msgId, convId: conversationId }
           );
@@ -2021,7 +2908,7 @@ export function useLocalChat() {
           return;
         }
 
-        if (!isSocketOpen()) {
+        if (!hostOpen) {
           tracerRef.current?.cancelSpan(msgId);
           tracerRef.current?.warn(
             transportTarget,
@@ -2029,7 +2916,7 @@ export function useLocalChat() {
             PacketErrorCode.SocketClosed,
             {
               transport,
-              host_url: activeHost,
+              host_key: routeInfo.hostKey,
               peers_online: peersRef.current.length,
             },
             { msgId, convId: conversationId }
@@ -2048,11 +2935,11 @@ export function useLocalChat() {
           msgId
         );
 
-        const sent = await sendJsonReliable({
+        const sent = await sendJsonReliableToHost(routeInfo.hostKey, {
           type: 'chat:message',
           id: msgId,
           conversationType: target.type,
-          targetId: target.id,
+          targetId: routeInfo.wireRoomId,
           senderName: identityRef.current.displayName,
           timestamp,
           encryptedPayload,
@@ -2070,8 +2957,8 @@ export function useLocalChat() {
             PacketErrorCode.SendRejected,
             {
               transport,
-              socket_open: isSocketOpen(),
-              host_url: activeHost,
+              socket_open: isHostSocketOpen(routeInfo.hostKey),
+              host_key: routeInfo.hostKey,
             },
             { msgId, convId: conversationId }
           );
@@ -2084,7 +2971,7 @@ export function useLocalChat() {
           'packet_dispatched_awaiting_ack',
           {
             transport,
-            host_url: activeHost,
+            host_key: routeInfo.hostKey,
             enc_ms: encMs,
           },
           { msgId, convId: conversationId }
@@ -2098,7 +2985,7 @@ export function useLocalChat() {
           {
             err_msg: sendErr instanceof Error ? sendErr.message : String(sendErr),
             transport,
-            host_url: activeHost,
+            host_key: routeInfo.hostKey,
           },
           { msgId, convId: conversationId }
         );
@@ -2107,10 +2994,11 @@ export function useLocalChat() {
     },
     [
       appendMessageIdempotent,
-      isSocketOpen,
+      isHostSocketOpen,
       isTauriApp,
       resolveConversationKeyResult,
-      sendJsonReliable,
+      resolvePeerHostKey,
+      sendJsonReliableToHost,
       verifiedPeers,
       verifiedRooms,
     ]
@@ -2119,10 +3007,65 @@ export function useLocalChat() {
   const sendFiles = useCallback(
     async (target: ChatTarget, files: File[]) => {
       if (!identityRef.current || files.length === 0) return;
-      const aesKey = await getConversationKey(target.type, target.id);
-      if (!aesKey || !isSocketOpen()) return;
-
       const conversationId = makeConversationId(target.type, target.id);
+      const routeInfo =
+        target.type === 'room'
+          ? parseScopedRoomTargetId(target.id)
+          : { hostKey: resolvePeerHostKey(target.id), wireRoomId: target.id };
+
+      const keyRes = await resolveConversationKeyResult(target.type, target.id);
+      const hostOpen = isHostSocketOpen(routeInfo.hostKey);
+
+      if (!keyRes.ok || !hostOpen) {
+        const errCode = !keyRes.ok ? keyRes.error.code : PacketErrorCode.SocketClosed;
+        const reasonText = !keyRes.ok
+          ? 'Kunci enkripsi belum siap (tunggu perangkat terhubung)'
+          : 'Koneksi ke host tujuan terputus';
+        tracerRef.current?.warn(
+          isTauriApp ? TraceTarget.TransportRustWs : TraceTarget.TransportBrowserWs,
+          'file_send_blocked',
+          errCode,
+          {
+            host_key: routeInfo.hostKey,
+            target_type: target.type,
+            target_id: routeInfo.wireRoomId,
+            file_count: files.length,
+            socket_open: hostOpen,
+          },
+          { convId: conversationId }
+        );
+        for (const file of files) {
+          const transferId = randomUuid();
+          await appendMessageIdempotent(
+            {
+              id: `file-${transferId}`,
+              conversationId,
+              conversationType: target.type,
+              senderId: identityRef.current.peerId,
+              senderName: identityRef.current.displayName,
+              timestamp: Date.now(),
+              kind: 'file',
+              encrypted: true,
+              file: {
+                transferId,
+                fileName: file.name,
+                mimeType: file.type || 'application/octet-stream',
+                size: file.size,
+                totalChunks: Math.max(1, Math.ceil(file.size / CHUNK_SIZE)),
+                receivedChunks: 0,
+                status: 'failed',
+                progress: 0,
+                speedBps: 0,
+                blobStored: false,
+                errorMessage: reasonText,
+              },
+            },
+            false
+          );
+        }
+        return;
+      }
+      const aesKey = keyRes.value;
 
       for (const file of files) {
         const transferId = randomUuid();
@@ -2160,11 +3103,11 @@ export function useLocalChat() {
           false
         );
 
-        sendJsonRaw({
+        sendJsonRawToHost(routeInfo.hostKey, {
           type: 'file:offer',
           transferId,
           conversationType: target.type,
-          targetId: target.id,
+          targetId: routeInfo.wireRoomId,
           senderName: identityRef.current.displayName,
           timestamp,
           fileName: file.name,
@@ -2180,11 +3123,11 @@ export function useLocalChat() {
         for (let chunkIndex = 0; chunkIndex < totalChunks; chunkIndex++) {
           if (cancelledTransfersRef.current.has(transferId)) {
             cancelledTransfersRef.current.delete(transferId);
-            sendJsonRaw({
+            sendJsonRawToHost(routeInfo.hostKey, {
               type: 'file:cancel',
               transferId,
               conversationType: target.type,
-              targetId: target.id,
+              targetId: routeInfo.wireRoomId,
             });
             await updateFileMessage(transferId, (m) => ({
               ...m,
@@ -2195,11 +3138,11 @@ export function useLocalChat() {
             break;
           }
 
-          if (!isSocketOpen()) {
+          if (!isHostSocketOpen(routeInfo.hostKey)) {
             await updateFileMessage(transferId, (m) => ({
               ...m,
               file: m.file
-                ? { ...m.file, status: 'failed', errorMessage: 'Koneksi Wi-Fi terputus' }
+                ? { ...m.file, status: 'failed', errorMessage: 'Koneksi host terputus' }
                 : undefined,
             }));
             break;
@@ -2213,7 +3156,7 @@ export function useLocalChat() {
           const headerObj = {
             transferId,
             conversationType: target.type,
-            targetId: target.id,
+            targetId: routeInfo.wireRoomId,
             senderId: identityRef.current.peerId,
             chunkIndex,
             totalChunks,
@@ -2226,7 +3169,7 @@ export function useLocalChat() {
           packet.set(headerBytes, 4);
           packet.set(encryptedBytes, 4 + headerBytes.length);
 
-          const chunkSent = await sendBinaryReliable(packet.buffer);
+          const chunkSent = await sendBinaryReliableToHost(routeInfo.hostKey, packet.buffer);
           if (!chunkSent) {
             await updateFileMessage(transferId, (m) => ({
               ...m,
@@ -2281,7 +3224,16 @@ export function useLocalChat() {
         }
       }
     },
-    [appendMessageIdempotent, getConversationKey, sendJsonRaw, updateFileMessage]
+    [
+      appendMessageIdempotent,
+      isHostSocketOpen,
+      isTauriApp,
+      resolveConversationKeyResult,
+      resolvePeerHostKey,
+      sendBinaryReliableToHost,
+      sendJsonRawToHost,
+      updateFileMessage,
+    ]
   );
 
   const cancelTransfer = useCallback((transferId: string) => {
@@ -2340,7 +3292,8 @@ export function useLocalChat() {
       if (callSessionRef.current && callSessionRef.current.status !== 'ended') return;
       const peer = peersRef.current.find((p) => p.peerId === peerId);
       if (!peer) return;
-      if (!isSocketOpen()) return;
+      const hostKey = resolvePeerHostKey(peerId);
+      if (!isHostSocketOpen(hostKey)) return;
 
       await ensureDmKey(peer);
       if (callEndedTimerRef.current) {
@@ -2373,7 +3326,7 @@ export function useLocalChat() {
       const engine = ensureCallEngine();
       await engine.prepareMedia(callType);
 
-      sendJsonRaw({
+      sendJsonRawToHost(hostKey, {
         type: 'call:invite',
         callId,
         targetPeerId: peer.peerId,
@@ -2385,7 +3338,7 @@ export function useLocalChat() {
       callRingTimeoutRef.current = window.setTimeout(async () => {
         const curr = callSessionRef.current;
         if (curr && curr.callId === callId && curr.status === 'outgoing') {
-          sendJsonRaw({
+          sendJsonRawToHost(resolvePeerHostKey(curr.peerId), {
             type: 'call:cancel',
             callId,
             targetPeerId: curr.peerId,
@@ -2396,7 +3349,14 @@ export function useLocalChat() {
         }
       }, 40000);
     },
-    [ensureCallEngine, ensureDmKey, finalizeCallCleanup, sendJsonRaw]
+    [
+      ensureCallEngine,
+      ensureDmKey,
+      finalizeCallCleanup,
+      isHostSocketOpen,
+      resolvePeerHostKey,
+      sendJsonRawToHost,
+    ]
   );
 
   const acceptCall = useCallback(async () => {
@@ -2428,17 +3388,17 @@ export function useLocalChat() {
       isCaller: false,
     });
 
-    sendJsonRaw({
+    sendJsonRawToHost(resolvePeerHostKey(current.peerId), {
       type: 'call:accept',
       callId: current.callId,
       targetPeerId: current.peerId,
     });
-  }, [ensureCallEngine, ensureDmKey, sendJsonRaw]);
+  }, [ensureCallEngine, ensureDmKey, resolvePeerHostKey, sendJsonRawToHost]);
 
   const rejectCall = useCallback(async () => {
     const current = callSessionRef.current;
     if (!current) return;
-    sendJsonRaw({
+    sendJsonRawToHost(resolvePeerHostKey(current.peerId), {
       type: 'call:reject',
       callId: current.callId,
       targetPeerId: current.peerId,
@@ -2446,13 +3406,13 @@ export function useLocalChat() {
     });
     ringtone.playEndChime();
     await finalizeCallCleanup('Ditolak', true);
-  }, [finalizeCallCleanup, sendJsonRaw]);
+  }, [finalizeCallCleanup, resolvePeerHostKey, sendJsonRawToHost]);
 
   const hangupCall = useCallback(async () => {
     const current = callSessionRef.current;
     if (!current) return;
     const msgType = current.status === 'outgoing' ? 'call:cancel' : 'call:hangup';
-    sendJsonRaw({
+    sendJsonRawToHost(resolvePeerHostKey(current.peerId), {
       type: msgType,
       callId: current.callId,
       targetPeerId: current.peerId,
@@ -2463,7 +3423,7 @@ export function useLocalChat() {
       current.status === 'outgoing' ? 'Dibatalkan' : 'Panggilan selesai',
       true
     );
-  }, [finalizeCallCleanup, sendJsonRaw]);
+  }, [finalizeCallCleanup, resolvePeerHostKey, sendJsonRawToHost]);
 
   const toggleCallAudioMute = useCallback(() => {
     const muted = callEngineRef.current?.toggleAudioMute() ?? false;
@@ -2503,14 +3463,53 @@ export function useLocalChat() {
 
   const clearActiveConversation = useCallback(async (target: ChatTarget) => {
     const convId = makeConversationId(target.type, target.id);
-    await clearConversationHistory(convId);
-    setMessages((prev) => prev.filter((m) => m.conversationId !== convId));
+    await clearConversationHistory(convId, target.type, target.id);
+    const removedTransferIds: string[] = [];
+    setMessages((prev) => {
+      for (const m of prev) {
+        if (m.conversationId === convId && m.file?.transferId) {
+          removedTransferIds.push(m.file.transferId);
+        }
+      }
+      return prev.filter((m) => m.conversationId !== convId);
+    });
+    if (removedTransferIds.length > 0) {
+      setFileUrls((prev) => {
+        const next = { ...prev };
+        for (const tid of removedTransferIds) {
+          if (next[tid]) {
+            try {
+              URL.revokeObjectURL(next[tid]);
+            } catch {
+              // ignore
+            }
+            delete next[tid];
+          }
+        }
+        return next;
+      });
+    }
+    outgoingQueueRef.current = outgoingQueueRef.current.filter(
+      (q) => !(q.conversationType === target.type && q.targetId === target.id)
+    );
+    setTelemetry((prev) => ({ ...prev, queuedCount: outgoingQueueRef.current.length }));
   }, []);
 
   const clearAllHistory = useCallback(async () => {
     await clearAllChatData();
     setMessages([]);
-    setFileUrls({});
+    setFileUrls((prev) => {
+      for (const url of Object.values(prev)) {
+        try {
+          URL.revokeObjectURL(url);
+        } catch {
+          // ignore
+        }
+      }
+      return {};
+    });
+    outgoingQueueRef.current = [];
+    setTelemetry((prev) => ({ ...prev, queuedCount: 0 }));
   }, []);
 
   const activeConversationId = useMemo(
@@ -2585,6 +3584,20 @@ export function useLocalChat() {
     probeHost,
     switchHostUrl,
     resetHostToLocal,
+    // Multi-Host + Host ID + Bridge A-B-C management
+    savedHosts,
+    hostRuntimes,
+    localHostConfig,
+    hostBridges,
+    refreshHostManagement,
+    updateLocalHostConfig,
+    addRemoteHost,
+    removeRemoteHost,
+    toggleHostEnabled,
+    updateHostAccessCode,
+    addHostBridge,
+    removeHostBridge,
+    // Diagnostics & Calls
     packetTraces,
     lastSyncFailure,
     formatPacketTraceReport,

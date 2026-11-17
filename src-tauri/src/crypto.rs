@@ -68,7 +68,9 @@ fn derive_shared_key_bytes(my_private_hex: &str, peer_public_hex: &str) -> Resul
         .map_err(|e| format!("Gagal memuat PublicKey P-256: {e}"))?;
 
     let shared = diffie_hellman(secret.to_nonzero_scalar(), public.as_affine());
-    let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), shared.raw_secret_bytes().as_slice());
+    let shared_bytes = shared.raw_secret_bytes();
+    let shared_slice: &[u8] = &shared_bytes;
+    let hk = Hkdf::<Sha256>::new(Some(HKDF_SALT), shared_slice);
     let mut aes_key = [0u8; 32];
     hk.expand(HKDF_INFO, &mut aes_key)
         .map_err(|e| format!("Gagal menurunkan kunci HKDF: {e}"))?;
@@ -159,10 +161,10 @@ pub fn rust_encrypt_text(
 
     let mut iv_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut iv_bytes);
-    let nonce = Nonce::from_slice(&iv_bytes);
+    let nonce = Nonce::from(iv_bytes);
 
     let ciphertext = cipher
-        .encrypt(nonce, plaintext.as_bytes())
+        .encrypt(&nonce, plaintext.as_bytes())
         .map_err(|e| format!("Enkripsi teks gagal: {e}"))?;
 
     Ok(EncryptedPayloadDto {
@@ -181,19 +183,19 @@ pub fn rust_decrypt_text(
     let iv_bytes = B64
         .decode(iv_base64.trim())
         .map_err(|e| format!("IV base64 tidak valid: {e}"))?;
-    if iv_bytes.len() != 12 {
-        return Err("Panjang IV harus 12 byte".to_string());
-    }
+    let iv_arr: [u8; 12] = iv_bytes
+        .try_into()
+        .map_err(|_| "Panjang IV harus 12 byte".to_string())?;
     let ciphertext = B64
         .decode(ciphertext_base64.trim())
         .map_err(|e| format!("Ciphertext base64 tidak valid: {e}"))?;
 
     let cipher = Aes256Gcm::new_from_slice(&key_bytes)
         .map_err(|e| format!("Inisialisasi AES-256-GCM gagal: {e}"))?;
-    let nonce = Nonce::from_slice(&iv_bytes);
+    let nonce = Nonce::from(iv_arr);
 
     let plain = cipher
-        .decrypt(nonce, ciphertext.as_ref())
+        .decrypt(&nonce, ciphertext.as_ref())
         .map_err(|_| "Dekripsi gagal: kunci atau integritas pesan tidak cocok".to_string())?;
 
     String::from_utf8(plain).map_err(|e| format!("Payload UTF-8 tidak valid: {e}"))
@@ -214,10 +216,10 @@ pub fn rust_encrypt_chunk(
 
     let mut iv_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut iv_bytes);
-    let nonce = Nonce::from_slice(&iv_bytes);
+    let nonce = Nonce::from(iv_bytes);
 
     let encrypted = cipher
-        .encrypt(nonce, plain_bytes.as_ref())
+        .encrypt(&nonce, plain_bytes.as_ref())
         .map_err(|e| format!("Enkripsi chunk gagal: {e}"))?;
 
     Ok(EncryptedChunkDto {
@@ -236,19 +238,19 @@ pub fn rust_decrypt_chunk(
     let iv_bytes = B64
         .decode(iv_base64.trim())
         .map_err(|e| format!("IV chunk tidak valid: {e}"))?;
-    if iv_bytes.len() != 12 {
-        return Err("Panjang IV harus 12 byte".to_string());
-    }
+    let iv_arr: [u8; 12] = iv_bytes
+        .try_into()
+        .map_err(|_| "Panjang IV harus 12 byte".to_string())?;
     let encrypted = B64
         .decode(encrypted_base64.trim())
         .map_err(|e| format!("Data terenkripsi chunk tidak valid: {e}"))?;
 
     let cipher = Aes256Gcm::new_from_slice(&key_bytes)
         .map_err(|e| format!("Inisialisasi AES-256-GCM gagal: {e}"))?;
-    let nonce = Nonce::from_slice(&iv_bytes);
+    let nonce = Nonce::from(iv_arr);
 
     let plain = cipher
-        .decrypt(nonce, encrypted.as_ref())
+        .decrypt(&nonce, encrypted.as_ref())
         .map_err(|_| "Dekripsi chunk gagal".to_string())?;
 
     Ok(B64.encode(plain))

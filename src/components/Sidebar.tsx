@@ -14,9 +14,12 @@ import {
   X,
 } from 'lucide-react';
 import { formatTime, makeConversationId } from '../lib/format';
+import { LOCAL_HOST_KEY } from '../lib/hostConfig';
 import type {
   ChatMessageRecord,
   ChatTarget,
+  HostConfigInfo,
+  HostConnectionRuntime,
   NetworkTelemetry,
   PeerInfo,
   RoomInfo,
@@ -37,6 +40,8 @@ interface SidebarProps {
   unreadCounts: Record<string, number>;
   telemetry: NetworkTelemetry;
   verifiedPeers: Record<string, VerifiedPeerRecord>;
+  localHostConfig?: HostConfigInfo | null;
+  hostRuntimes?: HostConnectionRuntime[];
   isDark: boolean;
   onToggleTheme: () => void;
   onOpenNetworkStatus: () => void;
@@ -77,6 +82,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   unreadCounts,
   telemetry,
   verifiedPeers,
+  localHostConfig,
+  hostRuntimes = [],
   isDark,
   onToggleTheme,
   onOpenNetworkStatus,
@@ -107,7 +114,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   const filteredRooms = useMemo(() => {
     if (filterTab === 'peers') return [];
-    return rooms.filter((r) => r.name.toLowerCase().includes(normalizedQuery));
+    return rooms.filter(
+      (r) =>
+        r.name.toLowerCase().includes(normalizedQuery) ||
+        (r.routeHostLabel || '').toLowerCase().includes(normalizedQuery)
+    );
   }, [rooms, filterTab, normalizedQuery]);
 
   const filteredPeers = useMemo(() => {
@@ -115,9 +126,22 @@ export const Sidebar: React.FC<SidebarProps> = ({
     return peers.filter(
       (p) =>
         p.displayName.toLowerCase().includes(normalizedQuery) ||
-        p.deviceLabel.toLowerCase().includes(normalizedQuery)
+        p.deviceLabel.toLowerCase().includes(normalizedQuery) ||
+        (p.routeHostLabel || '').toLowerCase().includes(normalizedQuery) ||
+        (p.originHostLabel || '').toLowerCase().includes(normalizedQuery)
     );
   }, [peers, filterTab, normalizedQuery]);
+
+  const connectedHostsCount = hostRuntimes.filter(
+    (r) => r.enabled && (r.status === 'connected' || r.status === 'degraded')
+  ).length;
+  const showHostOriginMeta = hostRuntimes.filter((r) => r.enabled).length > 1;
+
+  const headerSubLabel = localHostConfig?.hostId
+    ? connectedHostsCount > 1
+      ? `Host ${localHostConfig.hostId} · ${connectedHostsCount} host`
+      : `Host ${localHostConfig.hostId} · LokaKirim`
+    : 'LokaKirim Wi-Fi';
 
   const statusDot = {
     connected: 'bg-[#00A884]',
@@ -181,8 +205,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
                       <Edit2 className="h-3.5 w-3.5" />
                     </button>
                   </div>
-                  <p className="text-[11px] text-slate-500 dark:text-[#8696A0] truncate">
-                    LokaKirim Wi-Fi
+                  <p className="text-[11px] font-mono tabular-nums text-slate-500 dark:text-[#8696A0] truncate">
+                    {headerSubLabel}
                   </p>
                 </div>
               </div>
@@ -203,7 +227,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             className="lg:hidden inline-flex min-h-[36px] items-center gap-1.5 rounded-full bg-white/80 dark:bg-[#111B21]/70 border border-slate-200 dark:border-[#2A3942] px-2.5 py-1 text-[11px] font-medium cursor-pointer"
           >
             <span className={`h-2 w-2 rounded-full ${statusDot}`} />
-            <span className="text-slate-700 dark:text-[#E9EDEF]">
+            <span className="text-slate-700 dark:text-[#E9EDEF] tabular-nums">
               {telemetry.latencyMs !== null ? `${telemetry.latencyMs} ms` : statusLabel}
             </span>
           </button>
@@ -211,8 +235,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <button
             type="button"
             onClick={onOpenWifiShare}
-            title="QR & Alamat Wi-Fi Lokal"
-            aria-label="Bagikan QR Wi-Fi"
+            title="Host ID, QR & Pengelola Bridge"
+            aria-label="Bagikan QR Wi-Fi & Kelola Host"
             className="flex min-h-[44px] min-w-[44px] items-center justify-center rounded-full text-slate-600 dark:text-[#AEBAC1] hover:bg-black/5 dark:hover:bg-white/10 transition-colors cursor-pointer"
           >
             <QrCode className="h-5 w-5" />
@@ -295,6 +319,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
           const convId = makeConversationId('room', room.roomId);
           const unread = unreadCounts[convId] || 0;
           const lastMsg = lastMessages[convId];
+          const hostOrigin =
+            room.routeHostKey && room.routeHostKey !== LOCAL_HOST_KEY
+              ? room.routeHostLabel || room.originHostLabel
+              : showHostOriginMeta
+              ? room.routeHostLabel || room.originHostLabel
+              : undefined;
 
           return (
             <button
@@ -335,6 +365,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
                 <div className="mt-0.5 flex items-center justify-between gap-2">
                   <p className="truncate text-[13px] text-slate-500 dark:text-[#8696A0]">
+                    {hostOrigin ? `${hostOrigin} · ` : ''}
                     {isMember
                       ? formatPreview(lastMsg, identity?.peerId || '')
                       : 'Ketuk untuk bergabung ke ruang Wi-Fi'}
@@ -356,6 +387,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
           const unread = unreadCounts[convId] || 0;
           const isVerified = Boolean(verifiedPeers[peer.peerId]);
           const lastMsg = lastMessages[convId];
+
+          const originTag = peer.viaBridgeLabel
+            ? peer.viaBridgeLabel
+            : showHostOriginMeta || (peer.routeHostKey && peer.routeHostKey !== LOCAL_HOST_KEY)
+            ? peer.routeHostLabel || peer.originHostLabel
+            : undefined;
 
           return (
             <button
@@ -403,8 +440,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 <div className="mt-0.5 flex items-center justify-between gap-2">
                   <p className="truncate text-[13px] text-slate-500 dark:text-[#8696A0]">
                     {lastMsg
-                      ? formatPreview(lastMsg, identity?.peerId || '')
-                      : `${peer.deviceLabel} · Tersambung di Wi-Fi`}
+                      ? `${originTag ? `${originTag} · ` : ''}${formatPreview(
+                          lastMsg,
+                          identity?.peerId || ''
+                        )}`
+                      : `${peer.deviceLabel} · ${originTag || 'Tersambung di Wi-Fi'}`}
                   </p>
                   {unread > 0 && (
                     <span className="flex h-5 min-w-[20px] shrink-0 items-center justify-center rounded-full bg-[#00A884] px-1.5 font-mono text-[11px] font-semibold tabular-nums text-[#111B21]">
@@ -423,8 +463,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <Wifi className="h-5 w-5" />
             </div>
             <p className="text-xs text-slate-600 dark:text-[#8696A0] leading-relaxed mb-3">
-              Belum ada perangkat lain di Wi-Fi ini. Bagikan QR agar HP atau laptop lain bisa
-              langsung chat.
+              Belum ada perangkat lain di host ini. Bagikan QR / ID Host atau sambungkan ke host
+              teman.
             </p>
             <button
               type="button"
@@ -432,7 +472,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               className="inline-flex min-h-[44px] items-center gap-2 rounded-full bg-[#00A884] hover:bg-[#008F72] px-5 py-2 text-xs font-semibold text-[#111B21] transition-colors cursor-pointer"
             >
               <QrCode className="h-4 w-4" />
-              Bagikan QR Wi-Fi
+              Kelola Host & QR Wi-Fi
             </button>
           </div>
         )}

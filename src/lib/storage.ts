@@ -7,7 +7,7 @@ import type {
 } from '../types/chat';
 
 const DB_NAME = 'LokaKirimDB';
-const DB_VERSION = 1;
+const DB_VERSION = 2;
 
 const STORE_IDENTITY = 'identity';
 const STORE_MESSAGES = 'messages';
@@ -16,6 +16,16 @@ const STORE_ROOM_KEYS = 'roomKeys';
 const STORE_VERIFIED_PEERS = 'verifiedPeers';
 const STORE_VERIFIED_ROOMS = 'verifiedRooms';
 const STORE_ROOMS = 'rooms';
+const STORE_OUTGOING_QUEUE = 'outgoingQueue';
+
+export interface QueuedOutgoingMessage {
+  id: string;
+  conversationType: 'room' | 'dm';
+  targetId: string;
+  text: string;
+  timestamp: number;
+  hostKey?: string;
+}
 
 let dbPromise: Promise<IDBDatabase> | null = null;
 
@@ -49,6 +59,10 @@ function openDb(): Promise<IDBDatabase> {
       }
       if (!db.objectStoreNames.contains(STORE_ROOMS)) {
         db.createObjectStore(STORE_ROOMS, { keyPath: 'roomId' });
+      }
+      if (!db.objectStoreNames.contains(STORE_OUTGOING_QUEUE)) {
+        const qStore = db.createObjectStore(STORE_OUTGOING_QUEUE, { keyPath: 'id' });
+        qStore.createIndex('timestamp', 'timestamp', { unique: false });
       }
     };
 
@@ -196,20 +210,48 @@ export async function removeVerifiedRoom(roomId: string): Promise<void> {
   await txDelete(STORE_VERIFIED_ROOMS, roomId);
 }
 
-export async function clearConversationHistory(conversationId: string): Promise<void> {
+export async function loadOutgoingQueue(): Promise<QueuedOutgoingMessage[]> {
+  const items = await txGetAll<QueuedOutgoingMessage>(STORE_OUTGOING_QUEUE);
+  return items.sort((a, b) => a.timestamp - b.timestamp);
+}
+
+export async function saveOutgoingQueueItem(item: QueuedOutgoingMessage): Promise<void> {
+  await txPut(STORE_OUTGOING_QUEUE, item);
+}
+
+export async function removeOutgoingQueueItem(id: string): Promise<void> {
+  await txDelete(STORE_OUTGOING_QUEUE, id);
+}
+
+export async function clearConversationHistory(
+  conversationId: string,
+  targetType?: 'room' | 'dm',
+  targetId?: string
+): Promise<void> {
   const db = await openDb();
-  const allMsgs = await loadAllMessages();
+  const [allMsgs, allQueued] = await Promise.all([
+    loadAllMessages(),
+    loadOutgoingQueue(),
+  ]);
   const toDelete = allMsgs.filter((m) => m.conversationId === conversationId);
+  const queuedToDelete =
+    targetType && targetId
+      ? allQueued.filter((q) => q.conversationType === targetType && q.targetId === targetId)
+      : [];
 
   return new Promise((resolve, reject) => {
-    const tx = db.transaction([STORE_MESSAGES, STORE_FILES], 'readwrite');
+    const tx = db.transaction([STORE_MESSAGES, STORE_FILES, STORE_OUTGOING_QUEUE], 'readwrite');
     const msgStore = tx.objectStore(STORE_MESSAGES);
     const fileStore = tx.objectStore(STORE_FILES);
+    const queueStore = tx.objectStore(STORE_OUTGOING_QUEUE);
     for (const m of toDelete) {
       msgStore.delete(m.id);
       if (m.file?.transferId) {
         fileStore.delete(m.file.transferId);
       }
+    }
+    for (const q of queuedToDelete) {
+      queueStore.delete(q.id);
     }
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
@@ -219,9 +261,10 @@ export async function clearConversationHistory(conversationId: string): Promise<
 export async function clearAllChatData(): Promise<void> {
   const db = await openDb();
   return new Promise((resolve, reject) => {
-    const tx = db.transaction([STORE_MESSAGES, STORE_FILES], 'readwrite');
+    const tx = db.transaction([STORE_MESSAGES, STORE_FILES, STORE_OUTGOING_QUEUE], 'readwrite');
     tx.objectStore(STORE_MESSAGES).clear();
     tx.objectStore(STORE_FILES).clear();
+    tx.objectStore(STORE_OUTGOING_QUEUE).clear();
     tx.oncomplete = () => resolve();
     tx.onerror = () => reject(tx.error);
   });

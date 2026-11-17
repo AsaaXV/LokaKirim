@@ -98,6 +98,21 @@ export default function App() {
     probeHost,
     switchHostUrl,
     resetHostToLocal,
+    hostRuntimes,
+    localHostConfig,
+    hostBridges,
+    refreshHostManagement,
+    updateLocalHostConfig,
+    addRemoteHost,
+    removeRemoteHost,
+    toggleHostEnabled,
+    updateHostAccessCode,
+    addHostBridge,
+    removeHostBridge,
+    packetTraces,
+    lastSyncFailure,
+    formatPacketTraceReport,
+    getRustPacketTraces,
     callSession,
     localCallStream,
     remoteCallStream,
@@ -235,6 +250,8 @@ export default function App() {
         unreadCounts={unreadCounts}
         telemetry={telemetry}
         verifiedPeers={verifiedPeers}
+        localHostConfig={localHostConfig}
+        hostRuntimes={hostRuntimes}
         isDark={isDark}
         onToggleTheme={() => setIsDark((d) => !d)}
         onOpenNetworkStatus={() => setNetworkOpen(true)}
@@ -321,6 +338,10 @@ export default function App() {
         telemetry={telemetry}
         isTauriApp={isTauriApp}
         hostUrl={hostUrl}
+        packetTraces={packetTraces}
+        lastSyncFailure={lastSyncFailure}
+        formatPacketTraceReport={formatPacketTraceReport}
+        getRustPacketTraces={getRustPacketTraces}
       />
 
       <WifiShareModal
@@ -333,6 +354,17 @@ export default function App() {
         onProbeHost={probeHost}
         onSwitchHost={switchHostUrl}
         onResetHost={resetHostToLocal}
+        localHostConfig={localHostConfig}
+        hostRuntimes={hostRuntimes}
+        hostBridges={hostBridges}
+        onRefreshHostManagement={refreshHostManagement}
+        onUpdateLocalHostConfig={updateLocalHostConfig}
+        onAddRemoteHost={addRemoteHost}
+        onRemoveRemoteHost={removeRemoteHost}
+        onToggleHostEnabled={toggleHostEnabled}
+        onUpdateHostAccessCode={updateHostAccessCode}
+        onAddHostBridge={addHostBridge}
+        onRemoveHostBridge={removeHostBridge}
       />
 
       <CreateRoomModal

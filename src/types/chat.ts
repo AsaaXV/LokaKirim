@@ -7,6 +7,12 @@ export interface PeerInfo {
   deviceLabel: string;
   connectedAt: number;
   online: boolean;
+  originHostId?: string;
+  originHostLabel?: string;
+  hops?: number;
+  routeHostKey?: string;
+  routeHostLabel?: string;
+  viaBridgeLabel?: string;
 }
 
 export interface RoomInfo {
@@ -16,6 +22,11 @@ export interface RoomInfo {
   createdAt: number;
   isDefault?: boolean;
   memberIds: string[];
+  originHostId?: string;
+  originHostLabel?: string;
+  routeHostKey?: string;
+  routeHostLabel?: string;
+  wireRoomId?: string;
 }
 
 export interface ChatTarget {
@@ -86,6 +97,61 @@ export interface LanNetworkInfo {
   hostname: string;
   addresses: LanAddress[];
   primaryUrl: string;
+  hostId?: string;
+  hostLabel?: string;
+  requiresAccessCode?: boolean;
+}
+
+export interface HostConfigInfo {
+  hostId: string;
+  hostLabel: string;
+  requiresAccessCode: boolean;
+  accessCode?: string | null;
+  bridgeCount: number;
+}
+
+export interface HostBridgeInfo {
+  id: string;
+  targetUrl: string;
+  targetHostId?: string | null;
+  targetHostLabel?: string | null;
+  direction: 'outbound' | 'inbound' | string;
+  status: 'connected' | 'handshaking' | 'reconnecting' | 'auth_error' | string;
+  error?: string | null;
+  connectedAt?: number | null;
+}
+
+export type HostConnectionMode = 'client' | 'bridge';
+
+export type HostConnectionStatus =
+  | 'connected'
+  | 'degraded'
+  | 'reconnecting'
+  | 'auth_error'
+  | 'disconnected'
+  | 'disabled';
+
+export interface HostConnectionConfig {
+  key: string;
+  url: string;
+  label: string;
+  accessCode?: string;
+  enabled: boolean;
+  isLocal?: boolean;
+}
+
+export interface HostConnectionRuntime {
+  key: string;
+  url: string;
+  label: string;
+  hostId?: string;
+  hostLabel?: string;
+  status: HostConnectionStatus;
+  latencyMs: number | null;
+  peersOnline: number;
+  errorMessage?: string;
+  enabled: boolean;
+  isLocal: boolean;
 }
 
 export interface VerifiedPeerRecord {
@@ -140,4 +206,3 @@ export interface CallSessionState {
   endReason?: string;
   minimized: boolean;
 }
-

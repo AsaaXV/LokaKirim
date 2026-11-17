@@ -83,6 +83,8 @@ export class CallMediaEngine {
   private speakerMuted = false;
   private facingMode: 'user' | 'environment' = 'user';
   private destroyed = false;
+  private audioEncodeInFlight = 0;
+  private readonly maxAudioEncodeInFlight = 2;
 
   constructor(callbacks: CallEngineCallbacks) {
     this.callbacks = callbacks;
@@ -449,7 +451,9 @@ export class CallMediaEngine {
         }
         while (this.pcmAccumulator.length >= 1024) {
           const frame = new Int16Array(this.pcmAccumulator.splice(0, 1024));
-          void this.sendRustAudioFrame(frame);
+          if (this.audioEncodeInFlight < this.maxAudioEncodeInFlight) {
+            void this.sendRustAudioFrame(frame);
+          }
         }
       };
 
@@ -463,22 +467,28 @@ export class CallMediaEngine {
 
   private async sendRustAudioFrame(samples: Int16Array) {
     if (this.destroyed || !this.relayActive) return;
-    const aesKey = await this.callbacks.getDmAesKey(this.remotePeerId);
-    if (!aesKey) return;
-    const { ivBase64, encryptedBytes } = await encodeAudioFrameAsync(aesKey, samples);
-    const packet = buildCallBinaryPacket(
-      {
-        kind: 'call_audio',
-        callId: this.callId,
-        conversationType: 'dm',
-        targetId: this.remotePeerId,
-        senderId: this.selfPeerId,
-        iv: ivBase64,
-        sampleRate: TARGET_SAMPLE_RATE,
-      },
-      encryptedBytes
-    );
-    this.callbacks.sendBinary(packet);
+    this.audioEncodeInFlight += 1;
+    try {
+      const aesKey = await this.callbacks.getDmAesKey(this.remotePeerId);
+      if (!aesKey || this.destroyed || !this.relayActive) return;
+      const { ivBase64, encryptedBytes } = await encodeAudioFrameAsync(aesKey, samples);
+      if (this.destroyed || !this.relayActive) return;
+      const packet = buildCallBinaryPacket(
+        {
+          kind: 'call_audio',
+          callId: this.callId,
+          conversationType: 'dm',
+          targetId: this.remotePeerId,
+          senderId: this.selfPeerId,
+          iv: ivBase64,
+          sampleRate: TARGET_SAMPLE_RATE,
+        },
+        encryptedBytes
+      );
+      this.callbacks.sendBinary(packet);
+    } finally {
+      this.audioEncodeInFlight = Math.max(0, this.audioEncodeInFlight - 1);
+    }
   }
 
   private startRustRelayVideoTx() {
@@ -811,6 +821,7 @@ export class CallMediaEngine {
     }
     this.remoteStream = null;
     this.pcmAccumulator = [];
+    this.audioEncodeInFlight = 0;
     this.callbacks.onLocalStream(null);
     this.callbacks.onRemoteStream(null);
   }

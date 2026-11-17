@@ -77,9 +77,17 @@ export const TopBar: React.FC<TopBarProps> = ({
 
   const subtitle =
     activeTarget.type === 'room'
-      ? `${activeRoom?.memberIds.length || 0} perangkat di Wi-Fi ini`
+      ? activeRoom?.routeHostLabel
+        ? `${activeRoom?.memberIds.length || 0} perangkat · ${activeRoom.routeHostLabel}`
+        : `${activeRoom?.memberIds.length || 0} perangkat di Wi-Fi ini`
       : activePeer
-      ? `online · ${activePeer.deviceLabel}`
+      ? `online · ${activePeer.deviceLabel}${
+          activePeer.viaBridgeLabel
+            ? ` · ${activePeer.viaBridgeLabel}`
+            : activePeer.routeHostLabel
+            ? ` · ${activePeer.routeHostLabel}`
+            : ''
+        }`
       : 'tidak tersambung';
 
   const statusConfig = {

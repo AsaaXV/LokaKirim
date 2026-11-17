@@ -205,10 +205,10 @@ pub fn rust_encode_audio_frame(
         .map_err(|e| format!("Inisialisasi AES-256-GCM audio gagal: {e}"))?;
     let mut iv_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut iv_bytes);
-    let nonce = Nonce::from_slice(&iv_bytes);
+    let nonce = Nonce::from(iv_bytes);
 
     let encrypted = cipher
-        .encrypt(nonce, compressed.as_ref())
+        .encrypt(&nonce, compressed.as_ref())
         .map_err(|e| format!("Enkripsi frame audio gagal: {e}"))?;
 
     Ok(RustEncodedMediaFrame {
@@ -229,19 +229,19 @@ pub fn rust_decode_audio_frame(
     let iv_bytes = B64
         .decode(iv_base64.trim())
         .map_err(|e| format!("IV audio base64 tidak valid: {e}"))?;
-    if iv_bytes.len() != 12 {
-        return Err("Panjang IV audio harus 12 byte".to_string());
-    }
+    let iv_arr: [u8; 12] = iv_bytes
+        .try_into()
+        .map_err(|_| "Panjang IV audio harus 12 byte".to_string())?;
     let encrypted = B64
         .decode(payload_base64.trim())
         .map_err(|e| format!("Payload audio terenkripsi tidak valid: {e}"))?;
 
     let cipher = Aes256Gcm::new_from_slice(&key_bytes)
         .map_err(|e| format!("Inisialisasi AES-256-GCM audio gagal: {e}"))?;
-    let nonce = Nonce::from_slice(&iv_bytes);
+    let nonce = Nonce::from(iv_arr);
 
     let compressed = cipher
-        .decrypt(nonce, encrypted.as_ref())
+        .decrypt(&nonce, encrypted.as_ref())
         .map_err(|_| "Dekripsi frame audio gagal".to_string())?;
 
     let samples = decode_ima_adpcm(&compressed)?;
@@ -267,10 +267,10 @@ pub fn rust_encrypt_media_frame(
         .map_err(|e| format!("Inisialisasi AES-256-GCM media gagal: {e}"))?;
     let mut iv_bytes = [0u8; 12];
     OsRng.fill_bytes(&mut iv_bytes);
-    let nonce = Nonce::from_slice(&iv_bytes);
+    let nonce = Nonce::from(iv_bytes);
 
     let encrypted = cipher
-        .encrypt(nonce, raw_bytes.as_ref())
+        .encrypt(&nonce, raw_bytes.as_ref())
         .map_err(|e| format!("Enkripsi frame media gagal: {e}"))?;
 
     Ok(RustEncryptedMediaDto {
@@ -289,19 +289,19 @@ pub fn rust_decrypt_media_frame(
     let iv_bytes = B64
         .decode(iv_base64.trim())
         .map_err(|e| format!("IV media tidak valid: {e}"))?;
-    if iv_bytes.len() != 12 {
-        return Err("Panjang IV media harus 12 byte".to_string());
-    }
+    let iv_arr: [u8; 12] = iv_bytes
+        .try_into()
+        .map_err(|_| "Panjang IV media harus 12 byte".to_string())?;
     let encrypted = B64
         .decode(encrypted_base64.trim())
         .map_err(|e| format!("Data frame media tidak valid: {e}"))?;
 
     let cipher = Aes256Gcm::new_from_slice(&key_bytes)
         .map_err(|e| format!("Inisialisasi AES-256-GCM media gagal: {e}"))?;
-    let nonce = Nonce::from_slice(&iv_bytes);
+    let nonce = Nonce::from(iv_arr);
 
     let plain = cipher
-        .decrypt(nonce, encrypted.as_ref())
+        .decrypt(&nonce, encrypted.as_ref())
         .map_err(|_| "Dekripsi frame media gagal".to_string())?;
 
     Ok(B64.encode(plain))

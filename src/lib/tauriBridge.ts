@@ -1,6 +1,11 @@
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { EncryptedPayload, LanNetworkInfo } from '../types/chat';
+import type {
+  EncryptedPayload,
+  HostBridgeInfo,
+  HostConfigInfo,
+  LanNetworkInfo,
+} from '../types/chat';
 
 export function isTauriRuntime(): boolean {
   return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window;
@@ -163,21 +168,25 @@ export async function rustGetCallCapabilities(): Promise<RustCallCapabilitiesDto
 }
 
 export interface RustWsOpenPayload {
+  hostKey: string;
   connId: number;
   url: string;
 }
 
 export interface RustWsTextPayload {
+  hostKey: string;
   connId: number;
   data: string;
 }
 
 export interface RustWsBinaryPayload {
+  hostKey: string;
   connId: number;
   dataBase64: string;
 }
 
 export interface RustWsClosePayload {
+  hostKey: string;
   connId: number;
   reason: string;
 }
@@ -188,38 +197,83 @@ export interface RustHostProbeResultDto {
   peersOnline: number;
   activeCalls: number;
   engine: string;
+  hostId?: string | null;
+  hostLabel?: string | null;
+  requiresAccessCode?: boolean;
+  bridgeCount?: number;
   error?: string | null;
 }
 
 export interface RustClientStatusDto {
+  hostKey: string;
   connected: boolean;
   connId?: number | null;
   url?: string | null;
   engine: string;
 }
 
-export async function rustWsConnect(wsUrl: string): Promise<number> {
-  return invoke<number>('rust_ws_connect', { wsUrl });
+export async function rustWsConnect(
+  hostKey: string,
+  wsUrl: string,
+  clientConnId?: number
+): Promise<number> {
+  return invoke<number>('rust_ws_connect', {
+    hostKey,
+    wsUrl,
+    clientConnId: clientConnId ?? null,
+  });
 }
 
-export async function rustWsDisconnect(): Promise<void> {
-  return invoke<void>('rust_ws_disconnect');
+export async function rustWsDisconnect(hostKey?: string): Promise<void> {
+  return invoke<void>('rust_ws_disconnect', { hostKey: hostKey ?? null });
 }
 
-export async function rustWsSendText(payload: string): Promise<boolean> {
-  return invoke<boolean>('rust_ws_send_text', { payload });
+export async function rustWsSendText(hostKey: string, payload: string): Promise<boolean> {
+  return invoke<boolean>('rust_ws_send_text', { hostKey, payload });
 }
 
-export async function rustWsSendBinary(dataBase64: string): Promise<boolean> {
-  return invoke<boolean>('rust_ws_send_binary', { dataBase64 });
+export async function rustWsSendBinary(hostKey: string, dataBase64: string): Promise<boolean> {
+  return invoke<boolean>('rust_ws_send_binary', { hostKey, dataBase64 });
 }
 
-export async function rustWsStatus(): Promise<RustClientStatusDto> {
-  return invoke<RustClientStatusDto>('rust_ws_status');
+export async function rustWsStatus(hostKey?: string): Promise<RustClientStatusDto[]> {
+  return invoke<RustClientStatusDto[]>('rust_ws_status', { hostKey: hostKey ?? null });
 }
 
 export async function rustProbeHost(hostUrl: string): Promise<RustHostProbeResultDto> {
   return invoke<RustHostProbeResultDto>('rust_probe_host', { hostUrl });
+}
+
+export async function rustGetHostConfig(): Promise<HostConfigInfo> {
+  return invoke<HostConfigInfo>('rust_get_host_config');
+}
+
+export async function rustSetHostConfig(
+  hostLabel?: string,
+  accessCode?: string
+): Promise<HostConfigInfo> {
+  return invoke<HostConfigInfo>('rust_set_host_config', {
+    hostLabel: hostLabel ?? null,
+    accessCode: accessCode ?? null,
+  });
+}
+
+export async function rustListBridges(): Promise<HostBridgeInfo[]> {
+  return invoke<HostBridgeInfo[]>('rust_list_bridges');
+}
+
+export async function rustAddBridge(
+  targetUrl: string,
+  accessCode?: string
+): Promise<HostBridgeInfo> {
+  return invoke<HostBridgeInfo>('rust_add_bridge', {
+    targetUrl,
+    accessCode: accessCode ?? null,
+  });
+}
+
+export async function rustRemoveBridge(bridgeId: string): Promise<void> {
+  return invoke<void>('rust_remove_bridge', { bridgeId });
 }
 
 export async function subscribeRustWsEvents(handlers: {
@@ -273,5 +327,3 @@ export async function rustLogPacketTrace(params: {
 export async function rustGetPacketTraces(): Promise<RustPacketTraceEntryDto[]> {
   return invoke<RustPacketTraceEntryDto[]>('rust_get_packet_traces');
 }
-
-
