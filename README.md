@@ -66,13 +66,16 @@ Workflow akan berjalan otomatis setiap kali terjadi:
 - **Push tag versi `v*`** (misalnya `v1.2.0`)
 - **Pemicu manual** melalui tab **Actions → Run workflow**
 
-### Hasil Rilis Otomatis
+### Hasil Rilis Otomatis (Ukuran Ringkas per-ABI)
 Setiap build berhasil akan otomatis menghasilkan:
 1. **GitHub Release** baru di menu **Releases** repositori Anda (menggunakan nama tag `v*` jika dipicu oleh tag, atau tag otomatis `v1.0.<run_number>` pada setiap push) lengkap dengan catatan rilis otomatis.
-2. **Dua file APK siap pasang** (`LokaKirim-debug.apk` dan `LokaKirim-release.apk`) yang langsung terlampir di halaman **Releases** dan juga tersedia di **Workflow Artifacts**.
+2. **APK terpisah per arsitektur & teroptimasi ukuran** (tanpa biner emulator x86/x86_64 dan dengan `LTO + strip + opt-level="z"`):
+   - **`LokaKirim-arm64-release.apk`** — Rekomendasi utama untuk hampir semua HP Android modern (64-bit ARM64)
+   - **`LokaKirim-armv7-release.apk`** — Untuk HP Android lama (32-bit ARMv7)
+   - **`LokaKirim-arm64-debug.apk`** — Versi debug ARM64
 
 ### Tanda Tangan Release APK (Keystore)
-Workflow selalu mengompilasi dan menandatangani **`LokaKirim-release.apk`** secara otomatis (`zipalign` + `apksigner`). Jika **Repository Secrets** belum diatur, workflow akan membuat keystore otomatis dengan `keytool` agar APK tetap siap dipasang. Agar tanda tangan antarversi konsisten (bisa *update* langsung tanpa copot pemasangan), tambahkan 4 **Repository Secrets** berikut di **Settings → Secrets and variables → Actions**:
+Workflow selalu mengompilasi dan menandatangani **`LokaKirim-arm64-release.apk`** & **`LokaKirim-armv7-release.apk`** secara otomatis (`zipalign` + `apksigner`). Jika **Repository Secrets** belum diatur, workflow akan membuat keystore otomatis dengan `keytool` agar APK tetap siap dipasang. Agar tanda tangan antarversi konsisten (bisa *update* langsung tanpa copot pemasangan), tambahkan 4 **Repository Secrets** berikut di **Settings → Secrets and variables → Actions**:
 
 | Nama Secret | Keterangan |
 | --- | --- |

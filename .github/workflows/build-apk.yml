@@ -76,8 +76,6 @@ jobs:
           targets: |
             aarch64-linux-android
             armv7-linux-androideabi
-            i686-linux-android
-            x86_64-linux-android
 
       - name: Siapkan Cargo.lock untuk Cache Rust
         run: |
@@ -96,9 +94,9 @@ jobs:
       - name: Patch AndroidManifest.xml (Cleartext LAN & Izin Wi-Fi)
         run: node scripts/patch-android-manifest.mjs
 
-      - name: Build Debug APK (Siap Pasang)
+      - name: Build Debug APK ARM64 (Ringkas & Siap Pasang)
         run: |
-          if ! npx tauri android build --apk --debug --ci > /tmp/tauri-debug-build.log 2>&1; then
+          if ! npx tauri android build --apk --debug --split-per-abi --ci --target aarch64 > /tmp/tauri-debug-build.log 2>&1; then
             echo "=== 80 BARIS LOG BUILD (TANPA DUMP ENV) ==="
             grep -v "Io(BeforeSpawn" /tmp/tauri-debug-build.log | tail -n 80 || true
             echo "=== RINGKASAN ERROR INTI ==="
@@ -110,21 +108,21 @@ jobs:
       - name: Kumpulkan Debug APK
         run: |
           mkdir -p artifacts
-          DEBUG_APK=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name "*universal*debug*.apk" | head -n 1)
+          DEBUG_APK=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name "*arm64*debug*.apk" | head -n 1)
           if [ -z "$DEBUG_APK" ]; then
-            DEBUG_APK=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name "*.apk" | head -n 1)
+            DEBUG_APK=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name "*debug*.apk" | head -n 1)
           fi
-          cp "$DEBUG_APK" artifacts/LokaKirim-debug.apk
+          cp "$DEBUG_APK" artifacts/LokaKirim-arm64-debug.apk
           ls -lh artifacts/
 
-      - name: Build Release APK (Selalu Dibuat & Ditandatangani)
+      - name: Build Release APK Ringkas per-ABI (ARM64 + ARMv7, Selalu Ditandatangani)
         env:
           ANDROID_KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
           ANDROID_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
           ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
           ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
         run: |
-          if ! npx tauri android build --apk --ci > /tmp/tauri-release-build.log 2>&1; then
+          if ! npx tauri android build --apk --split-per-abi --ci --target aarch64 armv7 > /tmp/tauri-release-build.log 2>&1; then
             echo "=== 80 BARIS LOG RELEASE (TANPA DUMP ENV) ==="
             grep -v "Io(BeforeSpawn" /tmp/tauri-release-build.log | tail -n 80 || true
             echo "=== RINGKASAN ERROR RELEASE ==="
@@ -132,14 +130,6 @@ jobs:
             exit 1
           fi
           tail -n 30 /tmp/tauri-release-build.log
-          UNSIGNED_APK=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name "*universal*release*.apk" | head -n 1)
-          if [ -z "$UNSIGNED_APK" ]; then
-            UNSIGNED_APK=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name "*release*.apk" | head -n 1)
-          fi
-          if [ -z "$UNSIGNED_APK" ]; then
-            echo "File Release APK tidak ditemukan di src-tauri/gen/android/app/build/outputs/apk"
-            exit 1
-          fi
           BUILD_TOOLS_DIR=$(find "$ANDROID_HOME/build-tools" -maxdepth 1 -mindepth 1 -type d | sort -V | tail -n 1)
           KS_PATH="/tmp/lokakirim-release.keystore"
           if [ -n "$ANDROID_KEYSTORE_BASE64" ] && [ -n "$ANDROID_KEYSTORE_PASSWORD" ] && [ -n "$ANDROID_KEY_ALIAS" ] && [ -n "$ANDROID_KEY_PASSWORD" ]; then
@@ -149,7 +139,7 @@ jobs:
             KS_ALIAS="$ANDROID_KEY_ALIAS"
             KEY_PASS="$ANDROID_KEY_PASSWORD"
           else
-            echo "GitHub Secrets keystore belum diatur; membuat keystore release sementara via keytool agar LokaKirim-release.apk siap dipasang."
+            echo "GitHub Secrets keystore belum diatur; membuat keystore release sementara via keytool."
             KS_PASS="LokaKirimRelease2026!"
             KS_ALIAS="lokakirim"
             KEY_PASS="LokaKirimRelease2026!"
@@ -164,15 +154,40 @@ jobs:
               -keypass "$KEY_PASS" \
               -dname "CN=LokaKirim, OU=LAN, O=LokaKirim, L=Jakarta, ST=Jakarta, C=ID"
           fi
-          "$BUILD_TOOLS_DIR/zipalign" -p -f 4 "$UNSIGNED_APK" /tmp/lokakirim-aligned.apk
-          "$BUILD_TOOLS_DIR/apksigner" sign \
-            --ks "$KS_PATH" \
-            --ks-pass "pass:$KS_PASS" \
-            --ks-key-alias "$KS_ALIAS" \
-            --key-pass "pass:$KEY_PASS" \
-            --out artifacts/LokaKirim-release.apk \
-            /tmp/lokakirim-aligned.apk
-          rm -f "$KS_PATH" /tmp/lokakirim-aligned.apk
+
+          sign_apk() {
+            local src_apk="$1"
+            local out_apk="$2"
+            if [ -n "$src_apk" ] && [ -f "$src_apk" ]; then
+              rm -f /tmp/lokakirim-aligned.apk
+              "$BUILD_TOOLS_DIR/zipalign" -p -f 4 "$src_apk" /tmp/lokakirim-aligned.apk
+              "$BUILD_TOOLS_DIR/apksigner" sign \
+                --ks "$KS_PATH" \
+                --ks-pass "pass:$KS_PASS" \
+                --ks-key-alias "$KS_ALIAS" \
+                --key-pass "pass:$KEY_PASS" \
+                --out "$out_apk" \
+                /tmp/lokakirim-aligned.apk
+              rm -f /tmp/lokakirim-aligned.apk
+            fi
+          }
+
+          ARM64_APK=$(find src-tauri/gen/android/app/build/outputs/apk -type f \( -name "*arm64*release*.apk" -o -name "*aarch64*release*.apk" \) | head -n 1)
+          ARMV7_APK=$(find src-tauri/gen/android/app/build/outputs/apk -type f \( -name "*arm-release*.apk" -o -name "*armeabi*release*.apk" -o -name "*armv7*release*.apk" \) | head -n 1)
+
+          sign_apk "$ARM64_APK" "artifacts/LokaKirim-arm64-release.apk"
+          sign_apk "$ARMV7_APK" "artifacts/LokaKirim-armv7-release.apk"
+
+          if [ ! -f "artifacts/LokaKirim-arm64-release.apk" ] && [ ! -f "artifacts/LokaKirim-armv7-release.apk" ]; then
+            FALLBACK_APK=$(find src-tauri/gen/android/app/build/outputs/apk -type f -name "*release*.apk" | head -n 1)
+            if [ -z "$FALLBACK_APK" ]; then
+              echo "File Release APK tidak ditemukan di src-tauri/gen/android/app/build/outputs/apk"
+              exit 1
+            fi
+            sign_apk "$FALLBACK_APK" "artifacts/LokaKirim-release.apk"
+          fi
+
+          rm -f "$KS_PATH"
           ls -lh artifacts/
 
       - name: Upload Artifact APK
